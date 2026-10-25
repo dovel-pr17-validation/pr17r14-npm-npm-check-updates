@@ -1,0 +1,221 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
+import { parseDocument } from 'yaml'
+import { type CatalogsConfig, parseCatalogsConfig } from '../types/CatalogConfig.ts'
+import { type Index } from '../types/IndexType.ts'
+import { type Maybe } from '../types/Maybe.ts'
+import { type Options } from '../types/Options.ts'
+import { type PackageFile } from '../types/PackageFile.ts'
+import { type Version } from '../types/Version.ts'
+import { type VersionSpec } from '../types/VersionSpec.ts'
+import { isCatalogFile } from './catalogFile.ts'
+import getDevEnginesPackageManagers from './getDevEnginesPackageManagers.ts'
+import { pickBy } from './pick.ts'
+import resolveDepSections from './resolveDepSections.ts'
+import upgradeDependencies from './upgradeDependencies.ts'
+import { upgradeJsonCatalogDependencies } from './upgradeJsonCatalogDependencies.ts'
+import { updateYamlCatalogDependenciesAll } from './upgradeYamlCatalogDependencies.ts'
+import applyJsonValueEdits, { type JsonValueEdit } from './utils/applyJsonValueEdits.ts'
+import collectVersionEdits from './utils/collectVersionEdits.ts'
+import parseJson from './utils/parseJson.ts'
+
+/**
+ * Replaces upgraded dependency versions within the given sections of raw package.json text.
+ * Edits are applied via jsonc-parser so the original formatting is preserved and nested objects
+ * (e.g. arbitrarily deep overrides) are handled by the parser rather than by regex.
+ *
+ * A package that appears in more than one section is collapsed to a single (lowest) spec in
+ * current/upgraded, so when latest versions are available the upgrade is recomputed per section
+ * from that section's own spec. https://github.com/raineorshine/npm-check-updates/issues/1594
+ */
+function replaceDependencySections(
+  pkgData: string,
+  depSections: string[],
+  current: Index<VersionSpec>,
+  upgraded: Index<VersionSpec>,
+  options: Options,
+  latest?: Index<Version>,
+): string {
+  const parsed = parseJson<Record<string, unknown>>(pkgData)
+
+  /** Returns the current/upgraded spec maps to use for a given section. */
+  const specsForSection = (sectionName: string): [Index<VersionSpec>, Index<VersionSpec>] => {
+    const sectionObj = parsed?.[sectionName]
+    // overrides/packageManager and non-plain-object sections keep the collapsed current/upgraded specs
+    const useSectionSpecs =
+      latest &&
+      sectionName !== 'overrides' &&
+      sectionName !== 'packageManager' &&
+      sectionObj &&
+      typeof sectionObj === 'object' &&
+      !Array.isArray(sectionObj) &&
+      Object.values(sectionObj).every(spec => typeof spec === 'string')
+    if (!useSectionSpecs) return [current, upgraded]
+    const sectionCurrent = sectionObj as Index<VersionSpec>
+    // recompute upgrades from this section's own specs, keeping only the chosen deps so filtered
+    // deps are never reintroduced (latest is not filtered by filterResults/minimal)
+    const sectionUpgraded = pickBy(upgradeDependencies(sectionCurrent, latest, options), (spec, dep) => dep in upgraded)
+    return [sectionCurrent, sectionUpgraded]
+  }
+
+  const edits: JsonValueEdit[] = []
+  for (const section of depSections) {
+    // devEngines is not a { name: spec } map; it is handled in upgradePackageData
+    if (section === 'devEngines') continue
+
+    const sectionObj = parsed?.[section]
+    if (!sectionObj || typeof sectionObj !== 'object' || Array.isArray(sectionObj)) continue
+
+    const [sectionCurrent, sectionUpgraded] = specsForSection(section)
+    edits.push(...collectVersionEdits(sectionObj, [section], sectionCurrent, sectionUpgraded))
+  }
+
+  return applyJsonValueEdits(pkgData, edits)
+}
+
+/**
+ * Parses the text returned by upgradePackageData back into an object, using the same format it wrote.
+ * Catalog files are written as yaml; everything else stays json.
+ */
+export function parseUpgradedPackageData(pkgFile: Maybe<string>, data: string): PackageFile {
+  return pkgFile && isCatalogFile(pkgFile) ? parseDocument(data).toJSON() : parseJson<PackageFile>(data)
+}
+
+/**
+ * Upgrade the dependency declarations in the package data.
+ *
+ * @param pkgData The package.json data, as utf8 text
+ * @param current Old dependencies {package: range}
+ * @param upgraded New dependencies {package: range}
+ * @param options Options object
+ * @param pkgFile Optional path to the package file
+ * @param latest Optional fetched latest versions {package: version}, used to upgrade a package that
+ * appears in multiple sections with different specs correctly per section
+ * @returns The updated package data, as utf8 text
+ * @description Side Effect: prompts
+ */
+async function upgradePackageData(
+  pkgData: string,
+  current: Index<VersionSpec>,
+  upgraded: Index<VersionSpec>,
+  options: Options,
+  pkgFile?: string,
+  latest?: Index<Version>,
+  catalog?: boolean,
+) {
+  // Check if this is a catalog file (pnpm-workspace.yaml or package.json with catalogs)
+  if (pkgFile) {
+    const fileExtension = path.extname(pkgFile)
+
+    // Handle yaml catalog files
+    if (isCatalogFile(pkgFile)) {
+      const yamlContent = await fs.readFile(pkgFile, 'utf-8')
+      const catalogData: CatalogsConfig = parseCatalogsConfig(parseDocument(yamlContent).toJSON())
+
+      // every place a catalog can live, as the path prefix it is written back to
+      const workspacesData = catalogData.workspaces
+      const catalogSources: [string[], Index<VersionSpec> | undefined][] = [
+        ...Object.entries(catalogData.catalogs ?? {}).map(([name, catalog]): [string[], Index<VersionSpec>] => [
+          ['catalogs', name],
+          catalog,
+        ]),
+        [['catalog'], catalogData.catalog],
+        ...(workspacesData && !Array.isArray(workspacesData)
+          ? ([
+              ...Object.entries(workspacesData.catalogs ?? {}).map(
+                ([name, catalog]): [string[], Index<VersionSpec>] => [['workspaces', 'catalogs', name], catalog],
+              ),
+              [['workspaces', 'catalog'], workspacesData.catalog],
+            ] as [string[], Index<VersionSpec> | undefined][])
+          : []),
+      ]
+
+      // Reconstruct the list of updates to apply unfortunately we lost the path information during extraction before
+      const reconstructedUpdates: { path: string[]; newValue: string }[] = []
+      for (const [pathPrefix, catalog] of catalogSources) {
+        if (!catalog) continue
+        for (const [dep, version] of Object.entries(upgraded)) {
+          if (catalog[dep]) {
+            reconstructedUpdates.push({ path: [...pathPrefix, dep], newValue: version })
+          }
+        }
+      }
+
+      return updateYamlCatalogDependenciesAll({
+        fileContent: yamlContent,
+        upgrades: reconstructedUpdates,
+        options,
+        filePath: pkgFile,
+      })
+    }
+
+    // Handle package.json catalog files (check if content contains catalog/catalogs at root level or in workspaces)
+    if (fileExtension === '.json') {
+      // a catalog entry carries only the extracted catalog deps, so pkgData has no catalog sections to detect
+      if (catalog) {
+        return upgradeJsonCatalogDependencies(pkgFile, current, upgraded)
+      }
+
+      const parsed = parseJson<{
+        catalog?: unknown
+        catalogs?: unknown
+        workspaces?: string[] | { catalog?: unknown; catalogs?: unknown }
+      }>(pkgData)
+      const hasTopLevelCatalogs = parsed.catalog || parsed.catalogs
+      const hasWorkspacesCatalogs =
+        parsed.workspaces &&
+        !Array.isArray(parsed.workspaces) &&
+        (parsed.workspaces.catalog || parsed.workspaces.catalogs)
+
+      if (hasTopLevelCatalogs || hasWorkspacesCatalogs) {
+        return upgradeJsonCatalogDependencies(pkgFile, current, upgraded)
+      }
+    }
+  }
+
+  // Always include overrides since any upgraded dependencies needed to be upgraded in overrides as well.
+  // https://github.com/raineorshine/npm-check-updates/issues/1332
+  const depSections = [...resolveDepSections(options.dep), 'overrides']
+
+  let newPkgData = replaceDependencySections(pkgData, depSections, current, upgraded, options, latest)
+
+  /**
+   * Upgrades a single declaration outside of a { name: spec } section. current/upgraded are collapsed to
+   * one spec per package across all sections, so the upgrade is recomputed from the declaration's own spec.
+   */
+  const upgradeDeclaration = (name: string, spec: VersionSpec): Maybe<VersionSpec> => {
+    if (!upgraded[name]) return null
+    if (latest?.[name]) return upgradeDependencies({ [name]: spec }, { [name]: latest[name] }, options)[name]
+    // without a fetched version, only upgrade a declaration that matches the collapsed spec
+    return current[name] === spec ? upgraded[name] : null
+  }
+
+  const edits: JsonValueEdit[] = []
+  const pkg = parseJson<PackageFile>(pkgData)
+
+  if (depSections.includes('packageManager') && pkg.packageManager) {
+    const [name, spec] = pkg.packageManager.split('@')
+    // spec is an exact version, so the upgrade stays exact as the field requires
+    const version = upgradeDeclaration(name, spec)
+    if (version) {
+      edits.push({ path: ['packageManager'], value: `${name}@${version}` })
+    }
+  }
+
+  if (depSections.includes('devEngines')) {
+    for (const { entry, path } of getDevEnginesPackageManagers(pkg)) {
+      const version = upgradeDeclaration(entry.name, entry.version!)
+      if (version) {
+        edits.push({ path: [...path, 'version'], value: version })
+      }
+    }
+  }
+
+  if (edits.length > 0) {
+    newPkgData = applyJsonValueEdits(newPkgData, edits)
+  }
+
+  return newPkgData
+}
+
+export default upgradePackageData

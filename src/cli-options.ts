@@ -1,0 +1,1114 @@
+import path from 'node:path'
+import { defaultCacheFile } from './lib/cache.ts'
+import keyValueBy from './lib/keyValueBy.ts'
+import parseCooldown from './lib/parseCooldown.ts'
+import { sortBy } from './lib/sortBy.ts'
+import style from './lib/style.ts'
+import table from './lib/table.ts'
+import uncode from './lib/uncode.ts'
+import type CLIOption from './types/CLIOption.ts'
+import type ExtendedHelp from './types/ExtendedHelp.ts'
+
+/** Valid strings for the --target option. Indicates the desired version to upgrade to. */
+const supportedVersionTargets = ['latest', 'newest', 'greatest', 'minor', 'patch', 'semver']
+
+/** Pads the left side of each line in a string. */
+const padLeft = (s: string, n: number) =>
+  s
+    .split('\n')
+    .map(line => (line ? `${''.padStart(n, ' ')}${line}` : line))
+    .join('\n')
+
+/** Formats a code block for CLI or markdown. */
+const codeBlock = (code: string, { markdown, lang = 'js' }: { markdown?: boolean; lang?: string } = {}) =>
+  `${markdown ? '```' + lang + '\n' : ''}${padLeft(code, markdown ? 0 : 4)}${markdown ? '\n```' : ''}`
+
+/** Links to a README section, as a relative anchor in markdown or a full URL on the CLI. */
+const readmeLink = (text: string, anchor: string, { markdown }: { markdown?: boolean } = {}) =>
+  markdown ? `[${text}](#${anchor})` : `https://github.com/raineorshine/npm-check-updates#${anchor}`
+
+/** Parses a number from a string or number input. Throws if the value is not a number. */
+const parseNumberOption =
+  (optionName: string) =>
+  (value: unknown): number => {
+    if (typeof value === 'number') {
+      return value
+    } else if (typeof value === 'string') {
+      const parsed = parseInt(value, 10)
+      if (!isNaN(parsed)) {
+        return parsed
+      }
+    }
+
+    throw new Error(`${optionName} must be a number`)
+  }
+
+/** Renders the extended help for an option with usage information. */
+export const renderExtendedHelp = (option: CLIOption, { markdown }: { markdown?: boolean } = {}) => {
+  let output = ''
+  const usageLines: string[] = []
+
+  if (option.cli !== false) {
+    // add -u to doctor option
+    usageLines.push(
+      `ncu --${option.long}${option.arg ? ` [${option.arg}]` : ''}${option.long === 'doctor' ? ' -u' : ''}`,
+    )
+  }
+
+  if (option.type === 'boolean') {
+    usageLines.push(`ncu --no-${option.long}`)
+  }
+
+  if (option.short) {
+    // add -u to doctor option
+    usageLines.push(`ncu -${option.short}${option.arg ? ` [${option.arg}]` : ''}${option.long === 'doctor' ? 'u' : ''}`)
+  }
+
+  if (usageLines.length > 0) {
+    output = `Usage:\n\n${codeBlock(usageLines.join('\n'), { markdown, lang: 'sh' })}\n`
+  }
+
+  if (option.default !== undefined && !(Array.isArray(option.default) && option.default.length === 0)) {
+    output += `\nDefault: ${option.default}\n`
+  }
+
+  if (option.help) {
+    const helpText = typeof option.help === 'function' ? option.help({ markdown }) : option.help
+    output += `\n${(markdown ? helpText : uncode(helpText)).trim()}\n\n`
+  } else if (option.description) {
+    output += `\n${markdown ? option.description : uncode(option.description)}\n`
+  }
+
+  return output.trim()
+}
+
+/** Extended help for the --doctor option. */
+const extendedHelpDoctor: ExtendedHelp = ({
+  markdown,
+}) => `Iteratively installs upgrades and runs your project's tests to identify breaking upgrades. Reverts broken upgrades and updates package.json with working upgrades.
+
+${style.yellow('Requires `-u` to execute')} (modifies your package file, lock file, and node_modules)
+
+To be more precise:
+
+1. Runs \`npm install\` and \`npm test\` to ensure tests are currently passing.
+2. Runs \`ncu -u\` to optimistically upgrade all dependencies.
+3. If tests pass, hurray!
+4. If tests fail, restores package file and lock file.
+5. For each dependency, install upgrade and run tests.
+6. Prints broken upgrades with test error.
+7. Saves working upgrades to package.json.
+
+Additional options:
+
+${table({
+  markdown,
+  rows: [
+    [style.cyan('--doctorInstall'), 'specify a custom install script (default: `npm install` or `yarn`)'],
+    [style.cyan('--doctorTest'), 'specify a custom test script (default: `npm test`)'],
+  ],
+})}
+
+Example:
+
+${codeBlock(
+  `$ ncu --doctor -u
+Running tests before upgrading
+npm install
+npm run test
+Upgrading all dependencies and re-running tests
+ncu -u
+npm install
+npm run test
+Tests failed
+Identifying broken dependencies
+npm install
+npm install --no-save react@16.0.0
+npm run test
+  ✓ react 15.0.0 → 16.0.0
+npm install --no-save react-redux@7.0.0
+npm run test
+  ✗ react-redux 6.0.0 → 7.0.0
+
+/projects/myproject/test.js:13
+  throw new Error('Test failed!')
+  ^
+
+npm install --no-save react-dnd@11.1.3
+npm run test
+  ✓ react-dnd 10.0.0 → 11.1.3
+Saving partially upgraded package.json`,
+  { markdown, lang: 'console' },
+)}
+`
+
+/** Extended help for the filterResults option. */
+const extendedHelpFilterResults: ExtendedHelp = ({ markdown }) => {
+  return `Filters results based on a user provided predicate function after fetching new versions.
+
+\`filterResults\` runs _after_ new versions are fetched, in contrast to \`filter\`, \`reject\`, \`filterVersion\`, and \`rejectVersion\`, which run _before_. This allows you to exclude upgrades with \`filterResults\` based on how the version has changed (e.g. a major version change).
+
+> ⚠️ The predicate function is only available in .ncurc.js or when importing npm-check-updates as a module, not on the command line. To convert a JSON config to a JS config, follow the instructions at ${readmeLink('Config Functions', 'config-functions', { markdown })}.
+
+${codeBlock(
+  `${style.gray(`/** Exclude major version updates. Note this could also be achieved with --target semver.
+  @param {string} packageName               The name of the dependency.
+  @param {string} current                   Current version declaration (may be a range).
+  @param {SemVer[]} currentVersionSemver    Current version declaration in semantic versioning format (may be a range).
+  @param {string} upgraded                  Upgraded version.
+  @param {SemVer} upgradedVersionSemver     Upgraded version in semantic versioning format.
+  @returns {boolean}                        Return true if the upgrade should be kept; otherwise, it will be ignored.
+*/`)}
+${style.green('filterResults')}: (packageName, { current, currentVersionSemver, upgraded, upgradedVersionSemver }) ${style.cyan(
+    '=>',
+  )} {
+  ${style.cyan('const')} currentMajor ${style.red('=')} parseInt(currentVersionSemver[${style.cyan('0')}]?.major, ${style.cyan(
+    '10',
+  )})
+  ${style.cyan('const')} upgradedMajor ${style.red('=')} parseInt(upgradedVersionSemver?.major, ${style.cyan('10')})
+  ${style.red('if')} (currentMajor ${style.red('&&')} upgradedMajor) {
+    ${style.red('return')} currentMajor ${style.red('>=')} upgradedMajor
+  }
+  ${style.red('return')} ${style.cyan('true')}
+}`,
+  { markdown },
+)}
+
+For the SemVer type definition, see: https://git.coolaj86.com/coolaj86/semver-utils.js#semverutils-parse-semverstring
+
+`
+}
+
+/** Extended help for the --format option. */
+const extendedHelpFormat: ExtendedHelp = ({ markdown }) => {
+  const header =
+    'Modify the output formatting or show additional information. Specify one or more comma-delimited values.'
+  const tableString = table({
+    colAligns: ['right', 'left'],
+    markdown,
+    rows: [
+      ['dep', `Prints the dependency type (dev, peer, optional) of each package.`],
+      ['group', `Groups packages by major, minor, patch, and major version zero updates.`],
+      ['homepage', `Displays links to the package's homepage if specified in its package.json.`],
+      ['installedVersion', 'Prints the exact current version number instead of a range.'],
+      ['lines', 'Prints name@version on separate lines. Useful for piping to npm install.'],
+      ['ownerChanged', `Shows if the package owner has changed.`],
+      ['repo', `Infers and displays links to the package's source code repository. Requires packages to be installed.`],
+      ['diff', `Display link to compare the changes between package versions.`],
+      ['time', 'Shows the publish time of each upgrade.'],
+      ['cooldown', 'Shows a list of packages that were skipped due to the --cooldown threshold.'],
+    ],
+  })
+
+  return `${header}\n\n${padLeft(tableString, markdown ? 0 : 4)}
+
+\`group\` is the only value included by default. Prefix it with "no-" to remove it instead of replacing the entire list, e.g. \`--format no-group\` to disable the default grouping.
+`
+}
+
+/** Extended help for the --install option. */
+const extendedHelpInstall: ExtendedHelp = ({ markdown }) => {
+  const header = 'Control the auto-install behavior.'
+  const tableString = table({
+    colAligns: ['right', 'left'],
+    markdown,
+    rows: [
+      ['always', `Runs your package manager's install command automatically after upgrading.`],
+      ['never', `Does not install and does not prompt.`],
+      [
+        'prompt',
+        `Shows a message after upgrading that recommends an install, but does not install. In interactive mode, prompts for install. (default)`,
+      ],
+    ],
+  })
+
+  return `${header}\n\n${padLeft(tableString, markdown ? 0 : 4)}
+`
+}
+
+/** Extended help for the --interactiveSelect option. */
+const extendedHelpInteractiveSelect: ExtendedHelp = ({ markdown }) => {
+  const header = 'Control which upgrades are pre-selected in interactive mode. Only applies with `--interactive`.'
+  const tableString = table({
+    colAligns: ['right', 'left'],
+    markdown,
+    rows: [
+      [
+        'auto',
+        `Pre-selects patch and minor upgrades with \`--format group\`, which is enabled by default, and all upgrades otherwise. This is what \`ncu -i\` does. (default)`,
+      ],
+      ['none', `Nothing is pre-selected.`],
+      ['patch', `Patch upgrades are pre-selected.`],
+      ['minor', `Patch and minor upgrades are pre-selected.`],
+      ['all', `All upgrades are pre-selected, including major.`],
+    ],
+  })
+
+  return `${header}
+
+${padLeft(tableString, markdown ? 0 : 4)}
+
+Specify \`auto\` explicitly to restore the default when another value is set in your ${readmeLink('config file', 'config-file', { markdown })}.
+
+Major version zero upgrades (e.g. 0.1.0 → 0.2.0) are only pre-selected by \`all\`, since anything may change before 1.0.0. Custom groups returned by ${readmeLink('--groupFunction', 'groupfunction', { markdown })} are likewise only pre-selected by \`all\`.
+`
+}
+
+/** Extended help for the --filter option. */
+const extendedHelpFilterFunction: ExtendedHelp = ({ markdown }) => {
+  return `Include only package names matching the given string, wildcard, glob, comma-or-space-delimited list, /regex/, or predicate function. Only included packages will be checked with \`--peer\`.
+
+\`--filter\` runs _before_ new versions are fetched, in contrast to \`--filterResults\` which runs _after_.
+
+You can also specify a custom function in your .ncurc.js file, or when importing npm-check-updates as a module.
+
+> ⚠️ The predicate function is only available in .ncurc.js or when importing npm-check-updates as a module, not on the command line. To convert a JSON config to a JS config, follow the instructions at ${readmeLink('Config Functions', 'config-functions', { markdown })}.
+
+${codeBlock(
+  `${style.gray(`/**
+  @param name     The name of the dependency.
+  @param semver   A parsed Semver array of the current version.
+    (See: https://git.coolaj86.com/coolaj86/semver-utils.js#semverutils-parse-semverstring)
+  @returns        True if the package should be included, false if it should be excluded.
+*/`)}
+${style.green('filter')}: (name, semver) ${style.cyan('=>')} {
+  ${style.red('if')} (name.startsWith(${style.yellow(`'@myorg/'`)})) {
+    ${style.red('return')} ${style.cyan('false')}
+  }
+  ${style.red('return')} ${style.cyan('true')}
+}`,
+  { markdown },
+)}
+
+`
+}
+
+/** Extended help for the --filterVersion option. */
+const extendedHelpFilterVersionFunction: ExtendedHelp = () => {
+  return `Include only versions matching the given string, wildcard, glob, comma-or-space-delimited list, or /regex/.
+
+\`--filterVersion\` runs _before_ new versions are fetched, in contrast to \`--filterResults\` which runs _after_.
+
+To filter with a predicate function, use \`filter\` instead. It receives the package name and the parsed current version, so it can match on both name and version.
+`
+}
+
+/** Extended help for the --reject option. */
+const extendedHelpRejectFunction: ExtendedHelp = ({ markdown }) => {
+  return `The inverse of \`--filter\`. Exclude package names matching the given string, wildcard, glob, comma-or-space-delimited list, /regex/, or predicate function. This will also exclude them from the \`--peer\` check.
+
+\`--reject\` runs _before_ new versions are fetched, in contrast to \`--filterResults\` which runs _after_.
+
+You can also specify a custom function in your .ncurc.js file, or when importing npm-check-updates as a module.
+
+> ⚠️ The predicate function is only available in .ncurc.js or when importing npm-check-updates as a module, not on the command line. To convert a JSON config to a JS config, follow the instructions at ${readmeLink('Config Functions', 'config-functions', { markdown })}.
+
+${codeBlock(
+  `${style.gray(`/**
+  @param name     The name of the dependency.
+  @param semver   A parsed Semver array of the current version.
+    (See: https://git.coolaj86.com/coolaj86/semver-utils.js#semverutils-parse-semverstring)
+  @returns        True if the package should be excluded, false if it should be included.
+*/`)}
+${style.green('reject')}: (name, semver) ${style.cyan('=>')} {
+  ${style.red('if')} (name.startsWith(${style.yellow(`'@myorg/'`)})) {
+    ${style.red('return')} ${style.cyan('true')}
+  }
+  ${style.red('return')} ${style.cyan('false')}
+}`,
+  { markdown },
+)}
+
+`
+}
+
+/** Extended help for the --rejectVersion option. */
+const extendedHelpRejectVersionFunction: ExtendedHelp = () => {
+  return `The inverse of \`--filterVersion\`. Exclude versions matching the given string, wildcard, glob, comma-or-space-delimited list, or /regex/.
+
+\`--rejectVersion\` runs _before_ new versions are fetched, in contrast to \`--filterResults\` which runs _after_.
+
+To reject with a predicate function, use \`reject\` instead. It receives the package name and the parsed current version, so it can match on both name and version.
+
+`
+}
+
+/** Extended help for the --group option. */
+const extendedHelpGroupFunction: ExtendedHelp = ({ markdown }) => {
+  return `Customize how packages are divided into groups when using \`--format group\`.
+
+Only available in .ncurc.js or when importing npm-check-updates as a module, not on the command line. To convert a JSON config to a JS config, follow the instructions at ${readmeLink('Config Functions', 'config-functions', { markdown })}.
+
+${codeBlock(
+  `${style.gray(`/**
+  @param name             The name of the dependency.
+  @param defaultGroup     The predefined group name which will be used by default.
+  @param currentSpec      The current version range in your package.json.
+  @param upgradedSpec     The upgraded version range that will be written to your package.json.
+  @param upgradedVersion  The upgraded version number returned by the registry.
+  @returns                A predefined group name ('major' | 'minor' | 'patch' | 'majorVersionZero' | 'none') or a custom string to create your own group.
+*/`)}
+${style.green('groupFunction')}: (name, defaultGroup, currentSpec, upgradedSpec, upgradedVersion) ${style.cyan('=>')} {
+  ${style.red('if')} (name ${style.red('===')} ${style.yellow(`'typescript'`)} ${style.red(
+    '&&',
+  )} defaultGroup ${style.red('===')} ${style.yellow(`'minor'`)}) {
+    ${style.red('return')} ${style.yellow(`'major'`)}
+  }
+  ${style.red('if')} (name.startsWith(${style.yellow(`'@myorg/'`)})) {
+    ${style.red('return')} ${style.yellow(`'My Org'`)}
+  }
+  ${style.red('return')} defaultGroup
+}`,
+  { markdown },
+)}
+
+`
+}
+
+/** Extended help for the --target option. */
+const extendedHelpTarget: ExtendedHelp = ({ markdown }) => {
+  const header = 'Determines the version to upgrade to. (default: "latest")'
+  const tableString = table({
+    colAligns: ['right', 'left'],
+    markdown,
+    rows: [
+      [
+        'greatest',
+        `Upgrade to the highest version number published, regardless of release date or tag. Includes prereleases.`,
+      ],
+      [
+        'latest',
+        `Upgrade to whatever the package's "latest" dist-tag points to. When used with --cooldown, falls back to the greatest version that passes the cooldown threshold if the latest is too recent. Use --target "@latest" for strict behaviour that skips the package instead. Excludes prereleases unless --pre is specified.`,
+      ],
+      ['minor', 'Upgrade to the highest minor version without bumping the major version.'],
+      [
+        'newest',
+        `Upgrade to the version with the most recent publish date, even if there are other version numbers that are higher. Includes prereleases.`,
+      ],
+      ['patch', `Upgrade to the highest patch version without bumping the minor or major versions.`],
+      ['semver', `Upgrade to the highest version within the semver range specified in your package.json.`],
+      ['@[tag]', `Upgrade to the version published to a specific tag, e.g. 'next' or 'beta'.`],
+    ],
+  })
+
+  return `${header}
+
+${padLeft(tableString, markdown ? 0 : 4)}
+
+e.g.
+
+${codeBlock(`ncu --target semver`, { markdown, lang: 'sh' })}
+
+You can also specify a custom function in your .ncurc.js file, or when importing npm-check-updates as a module.
+
+> ⚠️ The predicate function is only available in .ncurc.js or when importing npm-check-updates as a module, not on the command line. To convert a JSON config to a JS config, follow the instructions at ${readmeLink('Config Functions', 'config-functions', { markdown })}.
+
+${codeBlock(
+  `${style.gray(`/** Upgrade major version zero to the next minor version, and everything else to latest.
+  @param name     The name of the dependency.
+  @param semver   A parsed Semver object of the upgraded version.
+    (See: https://git.coolaj86.com/coolaj86/semver-utils.js#semverutils-parse-semverstring)
+  @returns        One of the valid target values (specified in the table above).
+*/`)}
+${style.green('target')}: (name, semver) ${style.cyan('=>')} {
+  ${style.red('if')} (parseInt(semver[0]?.major) ${style.red('===')} ${style.yellow("'0'")}) ${style.red(
+    'return',
+  )} ${style.yellow("'minor'")}
+  ${style.red('return')} ${style.yellow("'latest'")}
+}`,
+  { markdown },
+)}
+`
+}
+
+/** Extended help for the --packageManager option. */
+const extendedHelpPackageManager: ExtendedHelp = ({ markdown }) => {
+  const header = 'Specifies the package manager to use when looking up versions.'
+  const tableString = table({
+    colAligns: ['right', 'left'],
+    markdown,
+    rows: [
+      ['npm', `System-installed npm. Default.`],
+      ['yarn', `System-installed yarn. Automatically used if yarn.lock is present.`],
+      ['pnpm', `System-installed pnpm. Automatically used if pnpm-lock.yaml is present.`],
+      ['bun', `System-installed bun. Automatically used if bun.lock or bun.lockb is present.`],
+    ],
+  })
+
+  return `${header}\n\n${padLeft(tableString, markdown ? 0 : 4)}
+`
+}
+
+/** Extended help for the --registryType option. */
+const extendedHelpRegistryType: ExtendedHelp = ({ markdown }) => {
+  const header = 'Specify whether `--registry` refers to a full npm registry or a simple JSON file.'
+  const tableString = table({
+    colAligns: ['right', 'left'],
+    markdown,
+    rows: [
+      ['npm', `Default npm registry`],
+      [
+        'json',
+        `Checks versions from a file or url to a simple JSON registry. Must include the ${style.cyan('`--registry`')} option.`,
+      ],
+    ],
+  })
+
+  return `${header}
+
+${padLeft(tableString, markdown ? 0 : 4)}
+
+Example:
+
+${codeBlock(
+  `${style.gray('# local file')}
+ncu --registryType json --registry ./registry.json
+
+${style.gray('# url')}
+ncu --registryType json --registry https://api.mydomain/registry.json
+
+${style.gray('# you can omit --registryType when the registry ends in .json')}
+ncu --registry ./registry.json
+ncu --registry https://api.mydomain/registry.json`,
+  { markdown, lang: 'sh' },
+)}
+
+registry.json:
+
+${codeBlock(
+  `{
+  "prettier": "2.7.1",
+  "typescript": "4.7.4"
+}`,
+  { markdown, lang: 'json' },
+)}
+`
+}
+
+/** Extended help for the --peer option. */
+const extendedHelpPeer: ExtendedHelp = ({ markdown }) => {
+  return `Check peer dependencies of installed packages and filter updates to compatible versions.
+
+${style.bold('Example')}:
+
+The following example demonstrates how \`--peer\` works, and how it uses peer dependencies from upgraded modules.
+
+The package ${style.bold('ncu-test-peer-update')} has two versions published:
+
+- 1.0.0 has peer dependency \`"ncu-test-return-version": "1.0.x"\`
+- 1.1.0 has peer dependency \`"ncu-test-return-version": "1.1.x"\`
+
+Our test app has the following dependencies:
+
+${codeBlock(
+  `"ncu-test-peer-update": "1.0.0",
+"ncu-test-return-version": "1.0.0"`,
+  { markdown, lang: 'json' },
+)}
+
+The latest versions of these packages are:
+
+${codeBlock(
+  `"ncu-test-peer-update": "1.1.0",
+"ncu-test-return-version": "2.0.0"`,
+  { markdown, lang: 'json' },
+)}
+
+${style.bold('With `--peer`')}:
+
+ncu upgrades packages to the highest version that still adheres to the peer dependency constraints:
+
+${codeBlock(
+  `ncu-test-peer-update     1.0.0  →  1.${style.cyan('1.0')}
+ncu-test-return-version  1.0.0  →  1.${style.cyan('1.0')}`,
+  { markdown, lang: 'text' },
+)}
+
+${style.bold('Without `--peer`')}:
+
+As a comparison: without using the \`--peer\` option, ncu will suggest the latest versions, ignoring peer dependencies:
+
+${codeBlock(
+  `ncu-test-peer-update     1.0.0  →  1.${style.cyan('1.0')}
+ncu-test-return-version  1.0.0  →  ${style.red('2.0.0')}`,
+  { markdown, lang: 'text' },
+)}
+`
+}
+
+/** Extended help for the --cooldown option. */
+const extendedHelpCooldown: ExtendedHelp = ({ markdown }) => {
+  return `The cooldown option helps protect against supply chain attacks by requiring package versions to be published at least the given amount of time before considering them for upgrade.
+
+The value can be a plain number (days) or a string with a unit suffix:
+
+${codeBlock(
+  `--cooldown 7       7 days
+--cooldown 7d      7 days (same as above)
+--cooldown 12h     12 hours
+--cooldown 30m     30 minutes`,
+  { markdown, lang: 'text' },
+)}
+
+With the default \`--target latest\`, if the latest dist-tag version is within the cooldown window, ncu falls back to the greatest version that passes the cooldown threshold. To instead skip the package entirely (strict behaviour), use \`--target "@latest"\`.
+
+${style.bold('Example')}:
+
+Let's examine how cooldown works with a package that has these versions available:
+
+${codeBlock(
+  `1.0.0          Released 7 days ago    (initial version)
+1.1.0          Released 6 days ago    (minor update)
+1.1.1          Released 5 days ago    (patch update)
+1.2.0          Released 5 days ago    (minor update)
+2.0.0-beta.1   Released 5 days ago    (beta release)
+1.2.1          Released 4 days ago    (patch update)
+1.3.0          Released 4 days ago    (minor update) [latest]
+2.0.0-beta.2   Released 3 days ago    (beta release)
+2.0.0-beta.3   Released 2 days ago    (beta release) [beta]`,
+  { markdown, lang: 'text' },
+)}
+
+${style.bold('With default target (latest)')}:
+
+${codeBlock(`ncu --cooldown 5`, { markdown, lang: 'sh' })}
+
+Falls back to 1.2.0 because:
+
+- Latest version (1.3.0) is only 4 days old (within 5-day cooldown)
+- 1.2.0 is the greatest version that is at least 5 days old
+
+${style.bold('With `@latest` strict target')}:
+
+${codeBlock(`ncu --cooldown 5 --target @latest`, { markdown, lang: 'sh' })}
+
+No update will be suggested because:
+
+- Latest version (1.3.0) is only 4 days old
+- Cooldown requires versions to be at least 5 days old
+- \`@latest\` is strict: no fallback to older versions
+
+${style.bold('With `@beta`/`@tag` target')}:
+
+${codeBlock(`ncu --cooldown 3 --target @beta`, { markdown, lang: 'sh' })}
+
+No update will be suggested because:
+
+- Current beta (2.0.0-beta.3) is only 2 days old
+- Cooldown requires versions to be at least 3 days old
+- Use \`--cooldown 2\` or lower to allow this update
+
+${style.bold('With other targets')}:
+
+${codeBlock(`ncu --cooldown 5 --target greatest|newest|minor|patch|semver`, { markdown, lang: 'sh' })}
+
+Each target will select the best version that is at least 5 days old:
+
+${codeBlock(
+  `greatest → 1.2.0        (highest version number outside cooldown)
+newest   → 2.0.0-beta.1 (most recently published version outside cooldown)
+minor    → 1.2.0        (highest minor version outside cooldown)
+patch    → 1.1.1        (highest patch version outside cooldown)`,
+  { markdown, lang: 'text' },
+)}
+
+You can also provide a custom function in your .ncurc.js file or when importing npm-check-updates as a module.
+
+> ⚠️ The predicate function is only available in .ncurc.js or when importing npm-check-updates as a module, not on the command line. To convert a JSON config to a JS config, follow the instructions at ${readmeLink('Config Functions', 'config-functions', { markdown })}.
+
+${codeBlock(
+  `${style.gray(`/** Set cooldown to 3 days but skip it for \`@my-company\` packages.
+  @param packageName     The name of the dependency.
+  @returns               Cooldown days restriction for given package.
+*/`)}
+${style.green('cooldown')}: packageName ${style.cyan('=>')} (packageName.startsWith(${style.yellow("'@my-company'")}) ? ${style.cyan('0')} : ${style.cyan('3')})`,
+  { markdown },
+)}
+
+### Package Manager Configurations
+
+If \`--cooldown\` is not set explicitly, \`ncu\` automatically reads the cooldown configuration from your package manager's own native config — each package manager only consults its own config and these are not cross-applied between package managers:
+
+${table({
+  colAligns: ['right', 'left'],
+  markdown,
+  rows: [
+    ['npm', `Reads \`min-release-age\` from \`.npmrc\`, excluding packages matched by \`min-release-age-exclude\`.`],
+    [
+      'yarn',
+      `Reads \`npmMinimalAgeGate\` from \`.yarnrc.yml\`, excluding packages matched by \`npmPreapprovedPackages\`.`,
+    ],
+    [
+      'pnpm',
+      `Reads \`minimumReleaseAge\` from \`pnpm-workspace.yaml\`, excluding packages matched by \`minimumReleaseAgeExclude\`.`,
+    ],
+  ],
+})}
+
+### Cooldown Formatting
+
+When using \`--format cooldown\` alongside the \`--cooldown\` option, \`ncu\` will show a list of packages that were skipped due to the \`--cooldown\` threshold.
+
+Example:
+
+${codeBlock(
+  `$ ncu --format cooldown --cooldown 7
+Skipped due to 7-day cooldown
+ @typescript-eslint/parser  ^8.50.0  →  ^8.59.1      5 days ago
+ eslint                     ^10.0.1  →  ^10.3.0      1 day ago`,
+  { markdown, lang: 'console' },
+)}
+`
+}
+
+// the default value of --format, shared with its parse function so that "no-" prefixed values can negate it
+const FORMAT_DEFAULT = ['group']
+
+// store CLI options separately from bin file so that they can be used to build type definitions
+const cliOptions: CLIOption[] = [
+  {
+    long: 'cache',
+    description: `Cache versions to a local cache file. Default \`--cacheFile\` is \`${defaultCacheFile}\` and default \`--cacheExpiration\` is 10 minutes.`,
+    type: 'boolean',
+  },
+  {
+    long: 'cacheClear',
+    description: 'Clear the default cache, or the cache file specified by `--cacheFile`.',
+    type: 'boolean',
+  },
+  {
+    long: 'cacheExpiration',
+    arg: 'min',
+    description: 'Cache expiration in minutes. Only works with `--cache`.',
+    parse: parseNumberOption('cacheExpiration'),
+    default: 10,
+    type: 'number',
+  },
+  {
+    long: 'cacheFile',
+    arg: 'path',
+    description: 'Filepath for the cache file. Only works with `--cache`.',
+    parse: value => {
+      if (typeof value !== 'string') {
+        throw new Error('cacheFile must be a string')
+      }
+      return path.isAbsolute(value) ? value : path.join(process.cwd(), value)
+    },
+    default: defaultCacheFile,
+    type: 'string',
+  },
+  {
+    long: 'color',
+    description: 'Force color in terminal.',
+    type: 'boolean',
+  },
+  {
+    long: 'concurrency',
+    arg: 'n',
+    description: 'Max number of concurrent HTTP requests to registry.',
+    parse: parseNumberOption('concurrency'),
+    default: 8,
+    type: 'number',
+  },
+  {
+    long: 'configFileName',
+    arg: 's',
+    description: 'Config file name. (default: .ncurc or .ncurc.{json,yaml,yml,js,mjs,cjs})',
+    type: 'string',
+  },
+  {
+    long: 'configFilePath',
+    arg: 'path',
+    description: 'Directory of .ncurc config file. (default: directory of `packageFile`)',
+    type: 'string',
+  },
+  {
+    long: 'cwd',
+    arg: 'path',
+    description: 'Working directory in which npm will be executed.',
+    type: 'string',
+  },
+  {
+    long: 'deep',
+    description: `Run recursively in current working directory. Alias of (\`--packageFile '**/package.json'\`).`,
+    type: 'boolean',
+  },
+  {
+    long: 'dep',
+    arg: 'value',
+    description:
+      'Check one or more sections of dependencies only: dev, optional, peer, prod, packageManager, or devEngines (comma-delimited).',
+    default: ['prod', 'dev', 'optional', 'packageManager'],
+    parse: value => (typeof value === 'string' ? value.split(/,|\s/) : value),
+    type: 'string | readonly string[]',
+  },
+  {
+    long: 'deprecated',
+    default: true,
+    description: 'Include deprecated packages. Use `--no-deprecated` to exclude deprecated packages.',
+    type: 'boolean',
+  },
+  {
+    long: 'doctor',
+    short: 'd',
+    description:
+      'Iteratively installs upgrades and runs tests to identify breaking upgrades. Requires `-u` to execute.',
+    type: 'boolean',
+    help: extendedHelpDoctor,
+  },
+  {
+    long: 'doctorInstall',
+    arg: 'command',
+    description:
+      'Specifies the install script to use in doctor mode. (default: `npm install` or the equivalent for your package manager)',
+    type: 'string',
+  },
+  {
+    long: 'doctorTest',
+    arg: 'command',
+    description: 'Specifies the test script to use in doctor mode. (default: `npm test`)',
+    type: 'string',
+  },
+  {
+    long: 'enginesNode',
+    description: 'Include only packages that satisfy engines.node as specified in the package file.',
+    type: 'boolean',
+  },
+  {
+    long: 'errorLevel',
+    short: 'e',
+    arg: 'n',
+    description:
+      'Set the error level. 1: exits with error code 0 if no errors occur. 2: exits with error code 0 if no packages need updating (useful for continuous integration).',
+    parse: parseNumberOption('errorLevel'),
+    default: 1,
+    type: 'number',
+  },
+  {
+    long: 'filter',
+    short: 'f',
+    arg: 'p',
+    description:
+      'Include only package names matching the given string, wildcard, glob, comma-or-space-delimited list, /regex/, or predicate function.',
+    type: 'string | RegExp | readonly (string | RegExp)[] | FilterFunction',
+    accumulate: true,
+    parse: (value, accum) => [...(accum || []), value],
+    help: extendedHelpFilterFunction,
+  },
+  {
+    long: 'filterResults',
+    arg: 'fn',
+    cli: false,
+    description: `Filters results based on a user provided predicate function after fetching new versions.`,
+    type: 'FilterResultsFunction',
+    help: extendedHelpFilterResults,
+  },
+  {
+    long: 'filterVersion',
+    arg: 'p',
+    description: 'Filter on package version using comma-or-space-delimited list or /regex/.',
+    type: 'string | RegExp | readonly (string | RegExp)[]',
+    accumulate: true,
+    parse: (value, accum) => [...(accum || []), value],
+    help: extendedHelpFilterVersionFunction,
+  },
+  {
+    long: 'format',
+    arg: 'value',
+    description:
+      'Modify the output formatting or show additional information. Specify one or more comma-delimited values: dep, group, ownerChanged, repo, time, lines, installedVersion, cooldown. `group` is the only value included by default; use `--format no-group` to disable it.',
+    parse: value => {
+      if (typeof value !== 'string') return value
+      const values = value.split(/,|\s/).filter(Boolean)
+      const negated = values.filter(v => v.startsWith('no-')).map(v => v.slice(3))
+      if (negated.length === 0) return values
+      const positive = values.filter(v => !v.startsWith('no-'))
+      return [...new Set([...FORMAT_DEFAULT.filter(v => !negated.includes(v)), ...positive])]
+    },
+    default: FORMAT_DEFAULT,
+    type: 'readonly string[]',
+    choices: [
+      'dep',
+      'group',
+      'homepage',
+      'ownerChanged',
+      'repo',
+      'diff',
+      'time',
+      'lines',
+      'installedVersion',
+      'cooldown',
+    ],
+    help: extendedHelpFormat,
+  },
+  {
+    long: 'global',
+    short: 'g',
+    description: 'Check global packages instead of in the current project.',
+    type: 'boolean',
+  },
+  {
+    long: 'groupFunction',
+    arg: 'fn',
+    cli: false,
+    description: `Customize how packages are divided into groups when using \`--format group\`.`,
+    type: 'GroupFunction',
+    help: extendedHelpGroupFunction,
+  },
+  {
+    long: 'install',
+    arg: 'value',
+    description: 'Control the auto-install behavior: always, never, prompt.',
+    help: extendedHelpInstall,
+    default: 'prompt',
+    choices: ['always', 'never', 'prompt'],
+    type: `'always' | 'never' | 'prompt'`,
+  },
+  {
+    long: 'interactive',
+    short: 'i',
+    description: 'Enable interactive prompts for each dependency; implies `-u` unless one of the json options are set.',
+    type: 'boolean',
+  },
+  {
+    long: 'interactiveSelect',
+    arg: 'value',
+    description:
+      'Control which upgrades are pre-selected in interactive mode: auto, none, patch, minor, all. Only applies with `--interactive`.',
+    help: extendedHelpInteractiveSelect,
+    default: 'auto',
+    choices: ['auto', 'none', 'patch', 'minor', 'all'],
+    type: `'auto' | 'none' | 'patch' | 'minor' | 'all'`,
+  },
+  {
+    // program.json is set to true in programInit if any options that begin with 'json' are true
+    long: 'jsonAll',
+    short: 'j',
+    description: 'Output new package file instead of human-readable message.',
+    type: 'boolean',
+  },
+  {
+    long: 'jsonDeps',
+    description:
+      'Like `jsonAll` but only lists `dependencies`, `devDependencies`, `optionalDependencies`, etc of the new package data.',
+    type: 'boolean',
+  },
+  {
+    long: 'jsonUpgraded',
+    description: 'Output upgraded dependencies in json.',
+    type: 'boolean',
+  },
+  {
+    long: 'loglevel',
+    short: 'l',
+    arg: 'n',
+    description: 'Amount to log: silent, error, minimal, warn, info, verbose, silly.',
+    default: 'warn',
+    type: 'string',
+  },
+  {
+    long: 'mergeConfig',
+    description: `Merges nested configs with the root config file for \`--deep\` or \`--packageFile\` options. (default: false)`,
+    type: 'boolean',
+  },
+  {
+    long: 'minimal',
+    short: 'm',
+    description: 'Do not upgrade newer versions that are already satisfied by the version range according to semver.',
+    type: 'boolean',
+  },
+  {
+    long: 'packageData',
+    arg: 'value',
+    description: 'Package file data (you can also use stdin).',
+    type: 'string | PackageFile',
+  },
+  {
+    long: 'packageFile',
+    arg: 'path|glob',
+    description: 'Package file(s) location. (default: ./package.json)',
+    type: 'string',
+  },
+  {
+    long: 'packageManager',
+    short: 'p',
+    arg: 's',
+    description: 'npm, yarn, pnpm, deno, bun, staticRegistry (default: npm).',
+    help: extendedHelpPackageManager,
+    type: `'npm' | 'yarn' | 'pnpm' | 'deno' | 'bun' | 'staticRegistry'`,
+  },
+  {
+    long: 'peer',
+    description: 'Check peer dependencies of installed packages and filter updates to compatible versions.',
+    type: 'boolean',
+    help: extendedHelpPeer,
+  },
+  {
+    long: 'pre',
+    arg: 'n',
+    description:
+      'Include prerelease versions, e.g. -alpha.0, -beta.5, -rc.2. Automatically set to 1 when `--target` is newest or greatest, or when the current version is a prerelease. (default: 0)',
+    parse: (value: unknown): boolean => {
+      if (typeof value === 'boolean') {
+        return value
+      } else if (typeof value === 'number') {
+        return !!value
+      } else if (typeof value === 'string') {
+        return !!parseInt(value, 10)
+      } else {
+        throw new Error('pre must be a number')
+      }
+    },
+    type: 'number',
+    // must be internally typed as number and externally typed as boolean to maintain compatibility with the CLI option and the RunOption
+    typePublic: 'boolean',
+  },
+  {
+    long: 'prefix',
+    arg: 'path',
+    description: 'Current working directory of npm.',
+    type: 'string',
+  },
+  {
+    long: 'registry',
+    short: 'r',
+    arg: 'uri',
+    description: 'Specify the registry to use when looking up package versions.',
+    type: 'string',
+  },
+  {
+    long: 'registryType',
+    arg: 'type',
+    description:
+      'Specify whether --registry refers to a full npm registry or a simple JSON file or url: npm, json. (default: npm)',
+    help: extendedHelpRegistryType,
+    type: `'npm' | 'json'`,
+  },
+  {
+    long: 'reject',
+    short: 'x',
+    arg: 'p',
+    description:
+      'Exclude packages matching the given string, wildcard, glob, comma-or-space-delimited list, /regex/, or predicate function.',
+    type: 'string | RegExp | readonly (string | RegExp)[] | FilterFunction',
+    accumulate: true,
+    parse: (value, accum) => [...(accum || []), value],
+    help: extendedHelpRejectFunction,
+  },
+  {
+    long: 'rejectVersion',
+    arg: 'p',
+    description: 'Exclude package.json versions using comma-or-space-delimited list or /regex/.',
+    type: 'string | RegExp | readonly (string | RegExp)[]',
+    accumulate: true,
+    parse: (value, accum) => [...(accum || []), value],
+    help: extendedHelpRejectVersionFunction,
+  },
+  {
+    long: 'removeRange',
+    description: 'Remove version ranges from the final package version.',
+    type: 'boolean',
+  },
+  {
+    long: 'root',
+    default: true,
+    description:
+      'Runs updates on the root project in addition to specified workspaces. Only allowed with `--workspace` or `--workspaces`.',
+    type: 'boolean',
+  },
+  {
+    long: 'retry',
+    arg: 'n',
+    description: 'Number of times to retry failed requests for package info.',
+    parse: parseNumberOption('retry'),
+    default: 3,
+    type: 'number',
+  },
+  {
+    long: 'silent',
+    short: 's',
+    description: "Don't output anything. Alias for `--loglevel` silent.",
+    type: 'boolean',
+  },
+  {
+    long: 'stdin',
+    description: 'Read package.json from stdin.',
+    type: 'string',
+  },
+  {
+    long: 'target',
+    short: 't',
+    arg: 'value',
+    description: `Determines the version to upgrade to: latest, newest, greatest, minor, patch, semver, \`@[tag]\`, or [function]. (default: latest)`,
+    help: extendedHelpTarget,
+    // eslint-disable-next-line no-template-curly-in-string
+    type: `${supportedVersionTargets.map(s => `'${s}'`).join(' | ')} | ${'`@${string}`'} | TargetFunction`,
+  },
+  {
+    long: 'timeout',
+    arg: 'ms',
+    description: 'Global timeout in milliseconds. (default: no global timeout and 30 seconds per npm-registry-fetch)',
+    parse: parseNumberOption('timeout'),
+    type: 'number',
+  },
+  {
+    long: 'upgrade',
+    short: 'u',
+    description: 'Overwrite package file with upgraded versions instead of just outputting to console.',
+    type: 'boolean',
+  },
+  {
+    long: 'verbose',
+    description: 'Log additional information for debugging. Alias for `--loglevel` verbose.',
+    type: 'boolean',
+  },
+  {
+    long: 'workspace',
+    arg: 's',
+    accumulate: true,
+    parse: (value, accum) => [...accum, value],
+    default: [],
+    description: 'Run on one or more specified workspaces. Add `--no-root` to exclude the root project.',
+    type: 'readonly string[]',
+  },
+  {
+    long: 'workspaces',
+    short: 'w',
+    description: 'Run on all workspaces. Add `--no-root` to exclude the root project.',
+    type: 'boolean',
+  },
+  {
+    long: 'cooldown',
+    short: 'c',
+    arg: 'period',
+    description:
+      'Sets a minimum age for package versions to be considered for upgrade. Accepts a number (days) or a string with a unit: "7d" (days), "12h" (hours), "30m" (minutes). Reduces the risk of installing newly published, potentially compromised packages.',
+    type: `number | string | CooldownFunction`,
+    help: extendedHelpCooldown,
+    parse: value => {
+      if (typeof value === 'number' || typeof value === 'function') {
+        return value
+      } else if (typeof value === 'string') {
+        const days = parseCooldown(value)
+        if (days !== null) return days
+        // Fall back to a bare number of days. Anything else yields NaN so that the caller rejects it,
+        // rather than parseInt silently reading "7x" as 7 days or "2 weeks" as 2 days.
+        const trimmed = value.trim()
+        const bareNumber = trimmed === '' ? NaN : Number(trimmed)
+        return Number.isFinite(bareNumber) ? bareNumber : NaN
+      } else {
+        throw new Error('cooldown must be a number, string, or function')
+      }
+    },
+  },
+]
+
+// put cliOptions into an object for O(1) lookups
+export const cliOptionsMap = keyValueBy<CLIOption, CLIOption>(cliOptions, option => ({
+  ...(option.short ? { [option.short]: option } : null),
+  ...(option.long ? { [option.long]: option } : null),
+}))
+
+const cliOptionsSorted = sortBy(cliOptions, v => v.long)
+
+export default cliOptionsSorted

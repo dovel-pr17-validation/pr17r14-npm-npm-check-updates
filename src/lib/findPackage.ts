@@ -1,0 +1,101 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
+import { text } from 'node:stream/consumers'
+import { findUp } from 'find-up'
+import { print } from '../lib/logging.ts'
+import { type Options } from '../types/Options.ts'
+import programError from './programError.ts'
+import style from './style.ts'
+
+/**
+ * Finds the package file and data.
+ *
+ * Searches as follows:
+ * `--packageData` flag
+ * `--packageFile` flag
+ * `--stdin`
+ * `--findUp`
+ */
+async function findPackage(options: Options): Promise<{
+  pkgData: string | null
+  pkgFile: string | null
+  pkgPath: string | null
+}> {
+  let pkgData
+  // eslint-disable-next-line no-useless-assignment
+  let pkgFile = null
+  const pkgPath = options.packageFile || 'package.json'
+
+  /** Reads the contents of a package file. */
+  async function getPackageDataFromFile(pkgFile: string | null | undefined, pkgFileName: string): Promise<string> {
+    // exit if no pkgFile to read from fs
+    if (pkgFile != null) {
+      const relPathToPackage = path.resolve(pkgFile)
+      print(options, `${options.upgrade ? 'Upgrading' : 'Checking'} ${relPathToPackage}`)
+    } else {
+      programError(
+        options,
+        `${style.red(
+          `No ${pkgFileName}`,
+        )}\n\nPlease add a ${pkgFileName} to the current directory, specify the ${style.cyan(
+          '--packageFile',
+        )} or ${style.cyan('--packageData')} options, or pipe a ${pkgFileName} to stdin and specify ${style.cyan(
+          '--stdin',
+        )}.`,
+        { color: false },
+      )
+    }
+
+    try {
+      return await fs.readFile(pkgFile!, 'utf-8')
+    } catch (e: any) {
+      programError(options, e)
+    }
+  }
+
+  print(options, 'Running in local mode', 'verbose')
+  print(options, 'Finding package file data', 'verbose')
+
+  // get the package data from the various input possibilities
+  if (options.packageData) {
+    pkgFile = null
+    pkgData = Promise.resolve(options.packageData)
+  } else if (options.packageFile) {
+    pkgFile = options.packageFile
+    pkgData = getPackageDataFromFile(pkgFile, pkgPath)
+  } else if (options.stdin) {
+    print(options, 'Waiting for package data on stdin', 'verbose')
+
+    // get data from stdin
+    // trim stdin to account for \r\n
+    const stdinData = await text(process.stdin)
+    const data = stdinData.trim().length > 0 ? stdinData : null
+
+    // if no stdin content fall back to searching for package.json from pwd and up to root
+    pkgFile = data || !pkgPath ? null : await findUp(pkgPath)
+    pkgData = data || getPackageDataFromFile(pkgFile, pkgPath)
+  } else {
+    // find the closest package starting from the current working directory and going up to the root
+    const cwd = options.cwd || process.cwd()
+    if (!pkgPath) {
+      pkgFile = null
+    } else if (!options.packageFile && options.packageManager === 'deno') {
+      // Deno 2.0 also supports managing dependencies in package.json,
+      // so fall back to it when no deno.json/deno.jsonc is found.
+      pkgFile = (await findUp(['deno.json', 'deno.jsonc'], { cwd })) || (await findUp(pkgPath, { cwd }))
+    } else {
+      pkgFile = await findUp(pkgPath, { cwd })
+    }
+    pkgData = getPackageDataFromFile(pkgFile, pkgPath)
+  }
+
+  const pkgDataResolved = await pkgData
+
+  return {
+    pkgData: pkgDataResolved,
+    pkgFile: pkgFile || null,
+    pkgPath,
+  }
+}
+
+export default findPackage

@@ -1,0 +1,598 @@
+import { format } from 'node:util'
+import parseGitHubUrl from 'parse-github-url'
+import semver from 'semver'
+import semverutils, { type SemVer, parse, parseRange } from 'semver-utils'
+import { type DependencyGroup } from '../types/DependencyGroup.ts'
+import { type Index } from '../types/IndexType.ts'
+import { type Maybe } from '../types/Maybe.ts'
+import { type Options } from '../types/Options.ts'
+import { type UpgradeGroup } from '../types/UpgradeGroup.ts'
+import { type VersionLevel } from '../types/VersionLevel.ts'
+import { escapeRegExp } from './escapeRegExp.ts'
+import { keyValueBy } from './keyValueBy.ts'
+import { sortBy } from './sortBy.ts'
+import style from './style.ts'
+
+type VersionPart = keyof SemVer
+
+const VERSION_BASE_PARTS: VersionPart[] = ['major', 'minor', 'patch']
+const VERSION_ADDED_PARTS: VersionPart[] = ['release', 'build']
+const VERSION_PARTS: VersionPart[] = [...VERSION_BASE_PARTS, ...VERSION_ADDED_PARTS]
+const VERSION_PART_DELIM: SemVer = {
+  major: '',
+  minor: '.',
+  patch: '.',
+  release: '-',
+  build: '+',
+}
+export const DEFAULT_WILDCARD = '^'
+export const WILDCARDS = ['^', '~', '.*', '.x']
+const WILDCARDS_PURE = ['^', '~', '^*', '*', 'x', 'x.x', 'x.x.x']
+const WILDCARD_PURE_REGEX = new RegExp(`^(${WILDCARDS_PURE.map(escapeRegExp).join('|')})$`)
+
+/** Matches an npm alias version declaration. */
+const NPM_ALIAS_REGEX = /^npm:(.*)@(.*)/
+
+interface UpgradeOptions {
+  wildcard?: string
+  removeRange?: boolean
+}
+
+/**
+ * @param version
+ * @returns The number of parts in the version
+ */
+export function numParts(version: string) {
+  const [semver] = semverutils.parseRange(version)
+
+  if (!semver) {
+    throw new Error(
+      format(
+        'semverutils.parseRange returned null when trying to parse "%s". This is probably a problem with the "semver-utils" dependency. Please report an issue at https://github.com/raineorshine/npm-check-updates/issues.',
+        version,
+      ),
+    )
+  }
+
+  return VERSION_PARTS.reduce((count, part) => (semver[part] ? count + 1 : count), 0)
+}
+
+/**
+ * Increases or decreases precision by the given amount, e.g. major+1 -> minor.
+ *
+ * @param precision
+ * @param n
+ * @returns
+ */
+export function precisionAdd(precision: VersionPart, n: number) {
+  if (n === 0) return precision
+
+  const index = VERSION_BASE_PARTS.includes(precision)
+    ? VERSION_BASE_PARTS.indexOf(precision) + n
+    : VERSION_ADDED_PARTS.includes(precision)
+      ? VERSION_BASE_PARTS.length + n
+      : null
+
+  if (index === null || !VERSION_PARTS[index]) {
+    throw new Error(`Invalid precision: ${precision}`)
+  }
+
+  return VERSION_PARTS[index]
+}
+
+/**
+ * Joins the major, minor, patch, release, and build parts (controlled by an
+ * optional precision arg) of a semver object into a dot-delimited string.
+ *
+ * @param semver
+ * @param [precision]
+ * @returns
+ */
+export function stringify(semver: SemVer, precision?: VersionPart) {
+  // get a list of the parts up until (and including) the given precision
+  // or all of them, if no precision is specified
+  const parts = precision ? VERSION_PARTS.slice(0, VERSION_PARTS.indexOf(precision) + 1) : VERSION_PARTS
+
+  // pair each part with its delimiter and join together
+  return parts
+    .filter(part => (precision && VERSION_BASE_PARTS.includes(precision)) || semver[part])
+    .map(part => VERSION_PART_DELIM[part] + (semver[part] || '0'))
+    .join('')
+}
+
+/**
+ * Gets how precise this version number is (major, minor, patch, release, or build)
+ *
+ * @param version
+ * @returns
+ */
+export function getPrecision(version: string) {
+  const [semver] = semverutils.parseRange(version)
+  // expects VERSION_PARTS to be in correct order
+  return VERSION_PARTS.slice()
+    .reverse()
+    .find(part => semver?.[part])
+}
+
+/**
+ * Sets the precision of a (loose) semver to the specified level: major, minor, etc.
+ *
+ * @param version
+ * @param [precision]
+ * @returns
+ */
+export function setPrecision(version: string, precision: VersionPart) {
+  const [semver] = semverutils.parseRange(version)
+  return stringify(semver, precision)
+}
+
+/**
+ * Adds a given wildcard (^,~,.*,.x) to a version number. Adds ^ and ~ to the
+ * beginning. Replaces everything after the major version number with .* or .x
+ *
+ * @param version
+ * @param wildcard
+ * @returns
+ */
+export function addWildcard(version: string, wildcard: string) {
+  return wildcard === '^' || wildcard === '~' ? wildcard + version : setPrecision(version, 'major') + wildcard
+}
+
+/**
+ * Returns true if the given string is one of the wild cards.
+ *
+ * @param version
+ * @returns
+ */
+export function isWildcard(version: string) {
+  return WILDCARD_PURE_REGEX.test(version)
+}
+
+/**
+ * Returns true if the given digit is a wildcard for a part of a version.
+ *
+ * @param versionPartValue
+ * @returns
+ */
+export function isWildPart(versionPartValue: Maybe<string>) {
+  return versionPartValue === '*' || versionPartValue === 'x'
+}
+
+/** Strips semver range prefixes (^, ~, >=, <=, >, <) from a version string. */
+export const stripRange = (version: string): string => version.replace(/^[~^<>=]+/, '')
+
+/** Number of build metadata characters to keep, not counting the leading +. */
+const MAX_BUILD_METADATA_LENGTH = 20
+
+/** Truncates long build metadata, e.g. the pnpm packageManager hash 10.14.0+sha512.ad27a79641b49... Only matches at the end of the string, so multi-part ranges are left alone. */
+export const shortenBuildMetadata = (version: string): string => {
+  const metadata = version.match(/\+(\S+)$/)?.[1]
+  if (!metadata || metadata.length <= MAX_BUILD_METADATA_LENGTH) return version
+  return version.slice(0, version.length - metadata.length) + metadata.slice(0, MAX_BUILD_METADATA_LENGTH) + '...'
+}
+
+/**
+ * Returns the index of the first version part that differs, along with the parts of `to`. The index
+ * is the number of parts when they are all equal.
+ *
+ * Strips any leading range operator (^, ~, <, <=, >, >=) from `from` and `to` independently, since
+ * an upgrade commonly changes the operator, e.g. "<1.2.3" -> "^1.2.9". Comparing the raw strings
+ * would leave the operator glued to the first numeric part and throw off the positional diff.
+ */
+function diffParts(from: string, to: string): { index: number; parts: string[] } {
+  const partsFrom = stripRange(from).split('.')
+  const parts = stripRange(to).split('.')
+  const index = parts.findIndex((part, i) => part !== partsFrom[i])
+  return { index: index >= 0 ? index : parts.length, parts }
+}
+
+/**
+ * Determines the part of a version string that has changed when comparing two versions. Assumes that the two version strings are in the same format. Returns null if no parts have changed.
+ *
+ * @param from
+ * @param to
+ */
+export function partChanged(from: string, to: string): UpgradeGroup {
+  if (from === to) return 'none'
+
+  const { index, parts } = diffParts(from, to)
+
+  return parts[0] === '0' ? 'majorVersionZero' : index === 0 ? 'major' : index === 1 ? 'minor' : 'patch'
+}
+
+/**
+ * Returns a list of group heading and a map of package names and versions.
+ * Used with `--format group` and takes into account the custom `--groupFunction`.
+ */
+export function getDependencyGroups(
+  newDependencies: Index<string>,
+  oldDependencies: Index<string>,
+  options: Options,
+): DependencyGroup[] {
+  const groups = keyValueBy<string, Index<string>>(newDependencies, (dep, to, accum) => {
+    const from = oldDependencies[dep]
+    const defaultGroup = partChanged(from, to)
+    const userDefinedUpgradeGroup =
+      options.groupFunction?.(dep, defaultGroup, parseRange(from), parseRange(to), parse(newDependencies[dep])) ??
+      defaultGroup
+    if (userDefinedUpgradeGroup === 'none') {
+      return accum
+    }
+    return {
+      ...accum,
+      [userDefinedUpgradeGroup]: {
+        ...accum[userDefinedUpgradeGroup],
+        [dep]: to,
+      },
+    }
+  })
+
+  // get the text for the default group headings
+  const headings = {
+    patch: style.green(style.bold('Patch') + '   Backwards-compatible bug fixes'),
+    minor: style.cyan(style.bold('Minor') + '   Backwards-compatible features'),
+    major: style.red(style.bold('Major') + '   Potentially breaking API changes'),
+    majorVersionZero: style.magenta(style.bold('Major version zero') + '   Anything may change'),
+  }
+
+  const groupOrder = Array.from(new Set(['patch', 'minor', 'major', 'majorVersionZero', ...Object.keys(groups).sort()]))
+
+  return groupOrder
+    .filter(groupName => {
+      return groupName in groups
+    })
+    .map(groupName => {
+      return {
+        groupName,
+        heading: groupName in headings ? headings[groupName as keyof typeof headings] : groupName,
+        packages: groups[groupName],
+      }
+    })
+}
+
+/**
+ * Colorize the parts of a version string (to) that are different than
+ * another (from). Assumes that the two version strings are in the same format.
+ *
+ * @param from
+ * @param to
+ * @returns
+ */
+export function colorizeDiff(from: string, to: string) {
+  let leadingWildcard = ''
+
+  // separate out leading ^ or ~ so it can be re-attached uncolored in front of the result
+  if (/^[~^]/.test(to)) {
+    leadingWildcard = to[0]
+    to = to.slice(1)
+  }
+
+  // split into parts for the displayed portion of `to`
+  const partsToColor = to.split('.')
+
+  const { index: i, parts } = diffParts(from, to)
+
+  // major = red (or any change before 1.0.0)
+  // minor = cyan
+  // patch = green
+  const color = i === 0 || parts[0] === '0' ? 'red' : i === 1 ? 'cyan' : 'green'
+
+  // if we are colorizing only part of the word, add a dot in the middle
+  const middot = i > 0 && i < partsToColor.length ? '.' : ''
+
+  return leadingWildcard + partsToColor.slice(0, i).join('.') + middot + style[color](partsToColor.slice(i).join('.'))
+}
+
+/**
+ * Extract prerelease tag, omitting build number.
+ * Example: 1.0.0-next.alpha.2 -> next.alpha
+ *
+ * @param version
+ */
+const getPre = (version: string) => {
+  const pre = semver.prerelease(version)
+  return pre && pre.slice(0, -1).join('.')
+}
+
+/**
+ * Check if it is allowed to compare two versions based on their prerelease tag.
+ *
+ * SemVer both states that different prerelease versions can't be compared
+ * and at the same time compares them as part of the version via strcmp
+ *
+ * @param a
+ * @param b
+ * @returns True if two versions can be compared by the means of SemVer
+ */
+export function isComparable(a: string, b: string) {
+  const preA = getPre(a)
+  const preB = getPre(b)
+  return typeof preA !== 'string' || typeof preB !== 'string' || preA === preB
+}
+
+/** Comparator used to sort semver versions. */
+export function compareVersions(a: string, b: string) {
+  const isValid = semver.valid(a) && semver.valid(b)
+  const isGreater = isValid ? semver.gt(a, b) : a > b
+  return isGreater ? 1 : a === b ? 0 : -1
+}
+
+/**
+ * Returns whether a version matches the current version at the given level: same major for minor,
+ * same major and minor for patch, anything for major. Returns null if the version is unparseable.
+ */
+function matchesLevel(v: string, cur: ReturnType<typeof semver.minVersion>, level: VersionLevel): boolean | null {
+  const parsed = semver.parse(v)
+  return (
+    parsed &&
+    (level === 'major' || parsed.major === cur?.major) &&
+    (level === 'major' || level === 'minor' || parsed.minor === cur?.minor)
+  )
+}
+
+/**
+ * Finds the greatest version at the given level (minor|patch).
+ *
+ * @param versions  Unsorted array of all available versions
+ * @param current   Current version or range
+ * @param level     major|minor
+ * @returns         String representation of the suggested version.
+ */
+export function findGreatestByLevel(versions: string[], current: string, level: VersionLevel): string | null {
+  if (!semver.validRange(current)) {
+    return null
+  }
+
+  const cur = semver.minVersion(current)
+  const versionsSorted = [...versions].sort(compareVersions).filter(v => matchesLevel(v, cur, level))
+
+  return versionsSorted.at(-1) || null
+}
+
+/** Returns a filter function that can be used to filter versions by a level. */
+export function filterByLevel(current: string, level: VersionLevel): (v: string) => boolean | null {
+  // semver.minVersion throws on non-semver specs (e.g. pnpm's `catalog:` / `workspace:`
+  // protocols, `link:`, `file:`). Guard with validRange to keep this safe.
+  if (!semver.validRange(current)) {
+    return () => false
+  }
+
+  const cur = semver.minVersion(current)
+  return (v: string) => matchesLevel(v, cur, level)
+}
+
+/** Returns a filter function that can be used to filter versions that satisfy a range. */
+export function filterBySatisfying(range: string): (v: string) => boolean {
+  return (v: string) => semver.satisfies(v, range)
+}
+
+/**
+ * @param version
+ * @returns True if the version is any kind of prerelease: alpha, beta, rc, pre
+ */
+export function isPre(version: string) {
+  return getPrecision(version) === 'release'
+}
+
+/** Checks if a string is a simple version in the format "v1". */
+const isMissingMinorAndPatch = (s: string) => /^[vV]?\d+$/.test(s)
+
+/** Checks if a version string is missing its match component, e.g. "1.0". */
+const isMissingPatch = (s: string) => /^[vV]?\d+\.\d+$/.test(s)
+
+/** Removes a leading 'v' or 'V' from a pseudo version.. */
+const fixLeadingV = (s: string) => s.replace(/^[vV]/, '')
+
+/** Converts a pseudo version that is missing its minor and patch components into a valid semver version. NOOP for valid semver versions. */
+const fixMissingMinorAndPatch = (s: string) => (isMissingMinorAndPatch(s) ? s + '.0.0' : s)
+
+/** Converts a pseudo version that is missing its patch component into a valid semver version. NOOP for valid semver versions. */
+const fixMissingPatch = (s: string) => (isMissingPatch(s) ? s + '.0' : s)
+
+/** Converts a pseudo version into a valid semver version. NOOP for valid semver versions. */
+export const fixPseudoVersion = (s: string) => fixMissingPatch(fixMissingMinorAndPatch(fixLeadingV(s)))
+
+/**
+ * Returns 'v' if the string starts with a v; otherwise, returns empty string.
+ *
+ * @param str
+ * @returns
+ */
+export function v(str: Maybe<string>) {
+  return str && (str[0] === 'v' || str[1] === 'v') ? 'v' : ''
+}
+
+/**
+ * Constructs an npm alias from the name and version of the actual package.
+ *
+ * @param name Name of the actual package.
+ * @param version Version of the actual package.
+ * @returns    "npm:package@x.y.z"
+ * @example    createNpmAlias('chalk', '2.0.0') -> 'npm:chalk@2.0.0'
+ */
+export const createNpmAlias = (name: string, version: string) => `npm:${name}@${version}`
+
+/**
+ * Parses an npm alias into a [name, version] 2-tuple.
+ *
+ * @returns  [name, version] or null if the input is not an npm alias
+ * @example  'npm:chalk@1.0.0' -> ['chalk', '1.0.0']
+ */
+export const parseNpmAlias = (alias: string) => {
+  const match = alias && alias.match && alias.match(NPM_ALIAS_REGEX)
+  return match && match.slice(1)
+}
+
+/**
+ * Returns true if a version declaration is an npm alias.
+ */
+export const isNpmAlias = (declaration: string) => declaration && !!declaration.match(NPM_ALIAS_REGEX)
+
+/**
+ * Replaces the version number embedded in an npm alias.
+ */
+export const upgradeNpmAlias = (declaration: string, upgraded: string) => {
+  const npmAlias = parseNpmAlias(declaration)
+  if (!npmAlias) return null
+  return createNpmAlias(npmAlias[0], upgraded)
+}
+
+/**
+ * Returns true if a version declaration is a GitHub URL with a valid semver version.
+ */
+export const isGitHubUrl = (declaration: string | null) => {
+  if (!declaration) return false
+  let parsed = null
+  try {
+    parsed = parseGitHubUrl(declaration)
+  } catch {
+    // Strings like `npm:postman-request@2.88.1-postman.33` can throw errors instead of simply returning null
+    // In node 18.17+ due to url.parse regression: https://github.com/nodejs/node/issues/49330
+    // So if this throws, we can assume it's not a valid GitHub URL.
+  }
+  if (!parsed || !parsed.branch) return false
+
+  const version = decodeURIComponent(parsed.branch).replace(/^semver:/, '')
+  return !!semver.validRange(version)
+}
+
+/**
+ * Returns the embedded tag in a GitHub URL.
+ */
+export const getGitHubUrlTag = (declaration: string | null) => {
+  if (!declaration) return null
+  const parsed = parseGitHubUrl(declaration)
+  if (!parsed || !parsed.branch) return null
+  const version = decodeURIComponent(parsed.branch).replace(/^semver:/, '')
+  return parsed && parsed.branch && semver.validRange(version) ? version : null
+}
+
+/**
+ * Upgrade an existing dependency declaration to satisfy the latest version.
+ *
+ * @param declaration Current version declaration (e.g. "1.2.x")
+ * @param latestVersion Latest version (e.g "1.3.2")
+ * @param [options={}]
+ * @returns The upgraded dependency declaration (e.g. "1.3.x")
+ */
+export function upgradeDependencyDeclaration(
+  declaration: string,
+  latestVersion: string | null,
+  options: UpgradeOptions = {},
+): string {
+  options.wildcard = options.wildcard || DEFAULT_WILDCARD
+
+  if (!latestVersion) {
+    return declaration
+  }
+
+  // parse the latestVersion
+  // return original declaration if latestSemver is invalid
+  const [latestSemver] = semverutils.parseRange(latestVersion)
+  if (!latestSemver) {
+    return declaration
+  }
+
+  // return global wildcards immediately
+  if (options.removeRange) {
+    return latestVersion
+  } else if (isWildcard(declaration)) {
+    return declaration
+  }
+
+  // parse the declaration
+  // if multiple ranges, use the semver with the least number of parts
+  const parsedRange = sortBy(
+    semverutils.parseRange(declaration).filter(range => range.operator !== '||' && range.operator !== '-'),
+    s => numParts(stringify(s)),
+  )
+
+  const [declaredSemver] = parsedRange
+
+  // Preserve an explicit upper bound (e.g. the "<10" in "^9.5.0 <10") when the upgraded version
+  // still falls within it, so an upgrade never exceeds a declared ceiling. Only the caret/tilde
+  // lower bound is bumped; the upper bound is kept verbatim.
+  const upperBound = parsedRange.find(range => range.operator === '<' || range.operator === '<=')
+  const lowerBound = parsedRange.find(range => range.operator === '^' || range.operator === '~')
+  if (upperBound && lowerBound && semver.valid(latestVersion) && semver.satisfies(latestVersion, declaration)) {
+    const upgradedLower = upgradeDependencyDeclaration(lowerBound.semver!, latestVersion, options)
+    return `${upgradedLower} ${upperBound.semver}`
+  }
+
+  /**
+   * Chooses version parts between the declared version and the latest.
+   * Base parts (major, minor, patch) are only included if they are in the original declaration.
+   * Added parts (release, build) are always included. They are only present if we are checking `--greatest` versions
+   * anyway.
+   */
+  function chooseVersion(part: VersionPart): string | null {
+    return (
+      (isWildPart(declaredSemver[part])
+        ? declaredSemver[part]
+        : VERSION_BASE_PARTS.includes(part) && declaredSemver[part]
+          ? latestSemver[part]
+          : VERSION_ADDED_PARTS.includes(part)
+            ? latestSemver[part]
+            : null) || null
+    )
+  }
+
+  // create a new semver object with major, minor, patch, build, and release parts
+  const newSemver = keyValueBy(VERSION_PARTS, (part: VersionPart) => ({
+    [part]: chooseVersion(part),
+  }))
+  const newSemverString = stringify(newSemver)
+  const version = v(declaredSemver.semver) + newSemverString
+
+  // determine the operator
+  // do not compact, because [undefined, '<'] must be differentiated from ['<']
+  const uniqueOperators = Array.from(new Set(parsedRange.map(range => range.operator)))
+  const operator = uniqueOperators[0] || ''
+
+  const hasWildcard = WILDCARDS.some(wildcard => newSemverString.includes(wildcard))
+  const isLessThanOrEqual = uniqueOperators[0] === '<' || uniqueOperators[0] === '<='
+  const isGreaterThan = uniqueOperators[0] === '>'
+  const isMixed = uniqueOperators.length > 1
+
+  // convert versions with </<= or mixed operators into the preferred wildcard
+  // only do so if the new version does not already contain a wildcard
+  return !hasWildcard && (isLessThanOrEqual || isMixed)
+    ? addWildcard(version, options.wildcard)
+    : // convert > to >= since there are likely no available versions > latest
+      // https://github.com/raineorshine/npm-check-updates/issues/957
+      (isGreaterThan ? '>=' : operator) + version
+}
+
+/** Reverts a valid semver version to a pseudo version. NOOP If the original version was a valid semver version. */
+const revertPseudoVersion = (current: string, latest: string) => {
+  /** Reverts a valid semver version to a pseudo version with a leading 'v'. NOOP If the original version was a valid semver version. */
+  const leadingV = v(current)
+  let result = leadingV ? leadingV + latest : latest
+
+  /** Reverts a valid semver version to a pseudo version that is missing its minor and patch components. NOOP If the original version was a valid semver version. */
+  const missingMinorAndPatch = isMissingMinorAndPatch(current)
+  result = missingMinorAndPatch ? result.slice(0, result.length - '.0.0'.length) : result
+
+  /** Reverts a valid semver version to a pseudo version that is missing its patch components. NOOP If the original version was a valid semver version. */
+  const missingPatch = isMissingPatch(current)
+  result = missingPatch ? result.slice(0, result.length - '.0'.length) : result
+
+  return result
+}
+
+/**
+ * Replaces the version number embedded in a GitHub URL.
+ */
+export const upgradeGitHubUrl = (declaration: string, upgraded: string) => {
+  // convert upgraded to a proper semver version if it is a pseudo version; otherwise, revertPseudoVersion will return an empty string
+  const upgradedNormalized = fixPseudoVersion(upgraded)
+  const parsedUrl = parseGitHubUrl(declaration)
+  if (!parsedUrl) return declaration
+  const tag = decodeURIComponent(parsedUrl.branch).replace(/^semver:/, '')
+  const upgradedTag = upgradeDependencyDeclaration(tag, revertPseudoVersion(tag, upgradedNormalized))
+  // the tag lives in the fragment, so replace only there
+  const hashIndex = declaration.indexOf('#')
+  return hashIndex === -1
+    ? declaration.replace(tag, upgradedTag)
+    : declaration.slice(0, hashIndex) + declaration.slice(hashIndex).replace(tag, upgradedTag)
+}

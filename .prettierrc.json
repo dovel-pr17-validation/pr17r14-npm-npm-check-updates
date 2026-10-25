@@ -1,0 +1,13 @@
+{
+  "arrowParens": "avoid",
+  "importOrder": ["<BUILTIN_MODULES>", "<THIRD_PARTY_MODULES>", "^\\.\\./", "^\\./"],
+  "importOrderSortSpecifiers": true,
+  "overrides": [{ "files": "*.ts", "options": { "parser": "typescript" } }],
+  "plugins": ["@trivago/prettier-plugin-sort-imports"],
+  "printWidth": 120,
+  "semi": false,
+  "singleQuote": true,
+  "tabWidth": 2,
+  "trailingComma": "all",
+  "useTabs": false
+}

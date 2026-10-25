@@ -1,0 +1,1411 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { JSONParser } from '@streamparser/json'
+import camelCase from 'camelcase'
+import memoize from 'fast-memoize'
+import { findUpSync } from 'find-up'
+import ini from 'ini'
+import type npmRegistryFetch from 'npm-registry-fetch'
+import picomatch from 'picomatch'
+import nodeSemver from 'semver'
+import { parseRange } from 'semver-utils'
+import untildify from 'untildify'
+import pkg from '../../package.json' with { type: 'json' }
+import interpolate from '../lib/interpolate.ts'
+import { keyValueBy } from '../lib/keyValueBy.ts'
+import { print, printSorted, sanitizeForDisplay } from '../lib/logging.ts'
+import parseCooldown from '../lib/parseCooldown.ts'
+import spawnCommand from '../lib/spawnCommand.ts'
+import * as versionUtil from '../lib/version-util.ts'
+import { type GetVersion } from '../types/GetVersion.ts'
+import { type Index } from '../types/IndexType.ts'
+import { type MockedVersions } from '../types/MockedVersions.ts'
+import { type NativeCooldown } from '../types/NativeCooldown.ts'
+import { type NpmConfig } from '../types/NpmConfig.ts'
+import { type NpmOptions } from '../types/NpmOptions.ts'
+import { type Options } from '../types/Options.ts'
+import { type Packument } from '../types/Packument.ts'
+import { type SpawnPleaseOptions } from '../types/SpawnPleaseOptions.ts'
+import { type SpawnResult } from '../types/SpawnResult.ts'
+import { type Version } from '../types/Version.ts'
+import { type CooldownInfo, type VersionResult } from '../types/VersionResult.ts'
+import { type VersionSpec } from '../types/VersionSpec.ts'
+import { filterPredicate, satisfiesCooldownPeriod } from './filters.ts'
+
+/**
+ * Dynamically imports npm-registry-fetch, lazily so importing the ncu API does not eagerly pull in
+ * its http/https/tls/dns/net networking stack and pay the ESM instantiation cost.
+ */
+const importRegistryFetch = () => import('npm-registry-fetch')
+let registryFetchPromise: ReturnType<typeof importRegistryFetch> | undefined
+
+/** Lazily loads npm-registry-fetch, caching the import promise after the first call. */
+const loadRegistryFetch = async () => (await (registryFetchPromise ??= importRegistryFetch())).default
+
+const EXPLICIT_RANGE_OPS = new Set(['-', '||', '&&', '<', '<=', '>', '>='])
+
+/** Returns true if the spec is an explicit version range (not ~ or ^). */
+const isExplicitRange = (spec: VersionSpec) => {
+  const range = parseRange(spec)
+  return range.some(parsed => EXPLICIT_RANGE_OPS.has(parsed.operator || ''))
+}
+
+/** Returns true if the spec has a caret or tilde bound (e.g. `^9.5.0 <10`, `~5.0.4`). */
+const hasCaretOrTilde = (spec: VersionSpec) => {
+  const range = parseRange(spec)
+  return range.some(parsed => parsed.operator === '^' || parsed.operator === '~')
+}
+
+/** Returns true if the version is valid semver with no padding (semver.valid tolerates whitespace like CR). */
+const isCleanVersion = (version: Version | undefined): version is Version =>
+  !!version && version.trim() === version && !!nodeSemver.valid(version)
+
+/** Returns true if there is no registry version to fetch for the spec: a non-semver spec (e.g. a git url) or a pure wildcard. */
+const isUnfetchable = (version: Version) =>
+  version && (!nodeSemver.validRange(version) || versionUtil.isWildcard(version))
+
+/** Fetches a packument or dist-tag from the npm registry. */
+const fetchPartialPackument = async (
+  name: string,
+  fields: (keyof Packument)[],
+  tag: string | null,
+  opts: npmRegistryFetch.FetchOptions = {},
+  version?: Version,
+): Promise<Partial<Packument>> => {
+  const corgiDoc = 'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*'
+  const fullDoc = 'application/json'
+
+  const npmRegistryFetch = await loadRegistryFetch()
+  const registry = npmRegistryFetch.pickRegistry(name, opts)
+  const headers = {
+    'user-agent': opts.userAgent || `npm-check-updates/${pkg.version} node/${process.version}`,
+    'ncu-version': pkg.version,
+    'ncu-pkg-id': `registry:${name}`,
+    accept: opts.fullMetadata ? fullDoc : corgiDoc,
+    ...opts.headers,
+  }
+  const url = new URL(
+    // Encode package name but preserve leading @ to avoid 404 errors
+    encodeURIComponent(name).replace(/^%40/, '@'),
+    // Ensure registry URL has trailing slash (URL constructor removes last segment)
+    registry.endsWith('/') ? registry : `${registry}/`,
+  )
+  if (version) {
+    url.pathname += `/${version}`
+  }
+  const fetchOptions = {
+    ...opts,
+    headers,
+    spec: name,
+  }
+
+  try {
+    if (opts.fullMetadata) {
+      return npmRegistryFetch.json(url.href, fetchOptions)
+    } else {
+      const controller = new AbortController()
+      const response = await npmRegistryFetch(url.href, { ...fetchOptions, signal: controller.signal })
+      const parser = new JSONParser({ paths: ['$.*'], keepStack: false })
+      const partialPackument: Partial<Packument> = { name }
+      let foundAll = false
+      let parseError: Error | null = null
+
+      parser.onValue = ({ key, value }) => {
+        if (foundAll || key === undefined) return
+        const k = key as keyof Packument
+        if (fields.includes(k)) {
+          // TODO: Fix type
+          partialPackument[k] = value as any
+          if (Object.keys(partialPackument).length === fields.length + 1) {
+            foundAll = true
+          }
+        }
+      }
+      parser.onError = (err: Error) => {
+        parseError = err
+      }
+
+      for await (const chunk of response.body as unknown as AsyncIterable<Buffer>) {
+        parser.write(chunk)
+        if (parseError) throw parseError
+        if (foundAll) break
+      }
+
+      // break alone does not tear down the minipass stream, so the
+      // rest of the packument keeps downloading. Abort to stop it.
+      if (foundAll) controller.abort()
+
+      return partialPackument
+    }
+  } catch (err: any) {
+    if (err.code !== 'E404' || opts.fullMetadata) {
+      throw err
+    }
+
+    // possible that corgis are not supported by this registry
+    return fetchPartialPackument(name, fields, tag, { ...opts, fullMetadata: true }, version)
+  }
+}
+
+/**
+ * Fetches the manifest published to a dist-tag in packument shape.
+ * Returns null if the tag does not exist or the registry does not serve manifests.
+ */
+const fetchTagManifest = async (
+  name: string,
+  tag: string,
+  opts: npmRegistryFetch.FetchOptions,
+): Promise<Partial<Packument> | null> => {
+  let manifest: Partial<Packument>
+  try {
+    // a manifest is a few KB, so read it whole instead of aborting the stream partway
+    manifest = await fetchPartialPackument(name, [], null, { ...opts, fullMetadata: true }, tag)
+  } catch (err: any) {
+    // a missing tag and an unsupported endpoint are both 4xx
+    if (err.statusCode >= 400 && err.statusCode < 500) return null
+    throw err
+  }
+
+  if (!manifest?.version) return null
+
+  return {
+    name,
+    'dist-tags': { [tag]: manifest.version },
+    versions: { [manifest.version]: manifest as Packument['versions'][string] },
+  }
+}
+
+interface GreatestWithFallbackResult {
+  targetVersion: string | null
+  fallbackVersion: string | null
+  targetBlockedByCooldown: boolean
+}
+
+/**
+ * A single-pass reducer that filters and resolves the target upgrade version and a cooldown fallback.
+ * It iterates through the available versions once, applying the provided filter and comparison logic
+ * to identify the best target version while simultaneously tracking the most recent version that
+ * falls outside the cooldown period. This avoids multiple loops for filtering, sorting, and
+ * detection of versions safe for upgrade.
+ */
+const findTargetAndFallback = ({
+  packageName,
+  currentVersion,
+  options,
+  versions,
+  time,
+  filter = () => true,
+  compare = versionUtil.compareVersions,
+}: {
+  packageName: string
+  currentVersion: string
+  options: Options
+  versions: Partial<Packument>[]
+  time?: Packument['time']
+  filter?: (version: string) => boolean | null
+  compare?: (v1: string, v2: string) => number
+}): GreatestWithFallbackResult => {
+  const isValidVersion = filterPredicate(options)
+  // minVersion throws on non-semver specs (e.g. catalog: or workspace:)
+  const cur = nodeSemver.validRange(currentVersion) ? nodeSemver.minVersion(currentVersion)?.version : null
+  if (!cur) {
+    return {
+      targetVersion: null,
+      fallbackVersion: null,
+      targetBlockedByCooldown: false,
+    }
+  }
+  const currentInCooldown = !satisfiesCooldownPeriod(packageName, cur, time?.[cur], options.cooldown)
+
+  const result = versions.reduce(
+    (acc, versionData) => {
+      const version = versionData.version
+      // a bad version would reach the report and the lexicographic fallback in compareVersions
+      if (!isCleanVersion(version)) return acc
+
+      // candidate must beat current fallback.
+      if (compare(version, acc.fallbackVersion) <= 0) return acc
+
+      const entry = { ...versionData, name: packageName } satisfies Partial<Packument>
+      if (!isValidVersion(entry)) return acc
+
+      if (!filter?.(version)) return acc
+
+      const versionTime = time?.[version]
+      const isSatisfiesCooldown = options.cooldown
+        ? satisfiesCooldownPeriod(packageName, version, versionTime, options.cooldown)
+        : true
+
+      const isNewTarget = compare(version, acc.targetVersion) > 0
+      if (isNewTarget) {
+        acc.targetVersion = version
+        acc.targetBlockedByCooldown = !isSatisfiesCooldown
+      }
+
+      if (isSatisfiesCooldown) {
+        acc.fallbackVersion = version
+      }
+
+      return acc
+    },
+    {
+      targetVersion: cur,
+      fallbackVersion: cur,
+      targetBlockedByCooldown: currentInCooldown,
+    } as {
+      targetVersion: string
+      fallbackVersion: string
+      targetBlockedByCooldown: boolean
+    },
+  )
+
+  const targetVersion: string | null = result.targetVersion
+  let fallbackVersion: string | null = result.fallbackVersion
+
+  if (fallbackVersion === result.targetVersion) {
+    fallbackVersion = null
+  }
+
+  if (fallbackVersion && !nodeSemver.gt(fallbackVersion, cur)) {
+    fallbackVersion = null
+  }
+
+  // don't "Block" current version
+  if (currentInCooldown && targetVersion === cur) {
+    result.targetBlockedByCooldown = false
+  }
+
+  return {
+    ...result,
+    targetVersion,
+    fallbackVersion,
+  }
+}
+
+/**
+ * Formats the raw version resolution data into a standardized VersionResult object.
+ * This function wraps the target version with its publish time and, if the target is
+ * currently in a cooldown period, adds the fallback version and cooldown metadata.
+ */
+const toVersionResult = ({
+  packageName,
+  currentVersion,
+  options,
+  time,
+  targetVersion,
+  fallbackVersion,
+  targetBlockedByCooldown,
+}: {
+  packageName: string
+  currentVersion: string
+  options: Options
+  time?: Packument['time']
+  targetVersion: string | null
+  fallbackVersion: string | null
+  targetBlockedByCooldown: boolean
+}): VersionResult => {
+  const targetMatch = {
+    version: targetVersion,
+    ...(targetVersion && time?.[targetVersion] ? { time: time[targetVersion] } : null),
+  }
+
+  // only check fallback if target is in cooldown period.
+  if (options.cooldown && targetVersion && targetBlockedByCooldown) {
+    const current = nodeSemver.validRange(currentVersion) ? nodeSemver.minVersion(currentVersion)?.version : null
+    const cooldownInfo: CooldownInfo = {
+      name: packageName,
+      currentVersion,
+      ...(current ? { currentVersionTime: time?.[current] } : null),
+      ...targetMatch,
+    }
+
+    if (fallbackVersion) {
+      const fallbackTime = time?.[fallbackVersion]
+      cooldownInfo.fallbackVersion = fallbackVersion
+      return {
+        version: fallbackVersion,
+        ...(fallbackTime ? { time: fallbackTime } : null),
+        cooldownInfo,
+      }
+    }
+
+    return {
+      cooldownInfo,
+    }
+  }
+
+  return targetMatch
+}
+
+/** Normalizes the keys of an npm config for pacote. */
+export const normalizeNpmConfig = (
+  npmConfig: NpmConfig,
+  // config path used to determine relative cafile paths
+  configPath?: string,
+): NpmConfig => {
+  const npmConfigToPacoteMap = {
+    cafile: (capath: string): undefined | { ca: string[] } => {
+      // load-cafile, based on github.com/npm/cli/blob/40c1b0f/lib/config/load-cafile.js
+      if (!capath) return
+      // synchronous since it is loaded once on startup
+      // https://github.com/raineorshine/npm-check-updates/issues/636?notification_referrer_id=MDE4Ok5vdGlmaWNhdGlvblRocmVhZDc0Njk2NjAzMjo3NTAyNzY%3D
+      const cadata = fs.readFileSync(path.resolve(configPath || '', untildify(capath)), 'utf8')
+      const delim = '-----END CERTIFICATE-----'
+      const output: string[] = cadata
+        .split(delim)
+        .filter(xs => !!xs.trim())
+        .map(xs => `${xs.trimStart()}${delim}`)
+      return { ca: output }
+    },
+    maxsockets: 'maxSockets',
+    'strict-ssl': 'strictSSL',
+  }
+
+  // all config variables are read in as strings, so we need to type coerce non-strings
+  // lowercased and hyphens removed for comparison purposes
+  const keyTypes: Index<'boolean' | 'number'> = {
+    all: 'boolean',
+    allowsameversion: 'boolean',
+    audit: 'boolean',
+    binlinks: 'boolean',
+    color: 'boolean',
+    commithooks: 'boolean',
+    description: 'boolean',
+    dev: 'boolean',
+    diffignoreallspace: 'boolean',
+    diffnameonly: 'boolean',
+    diffnoprefix: 'boolean',
+    difftext: 'boolean',
+    dryrun: 'boolean',
+    enginestrict: 'boolean',
+    force: 'boolean',
+    foregroundscripts: 'boolean',
+    formatpackagelock: 'boolean',
+    fund: 'boolean',
+    gittagversion: 'boolean',
+    global: 'boolean',
+    globalstyle: 'boolean',
+    ifpresent: 'boolean',
+    ignorescripts: 'boolean',
+    includestaged: 'boolean',
+    includeworkspaceroot: 'boolean',
+    installlinks: 'boolean',
+    json: 'boolean',
+    legacybundling: 'boolean',
+    legacypeerdeps: 'boolean',
+    link: 'boolean',
+    long: 'boolean',
+    offline: 'boolean',
+    omitlockfileregistryresolved: 'boolean',
+    packagelock: 'boolean',
+    packagelockonly: 'boolean',
+    parseable: 'boolean',
+    preferoffline: 'boolean',
+    preferonline: 'boolean',
+    progress: 'boolean',
+    readonly: 'boolean',
+    rebuildbundle: 'boolean',
+    save: 'boolean',
+    savebundle: 'boolean',
+    savedev: 'boolean',
+    saveexact: 'boolean',
+    saveoptional: 'boolean',
+    savepeer: 'boolean',
+    saveprod: 'boolean',
+    shrinkwrap: 'boolean',
+    signgitcommit: 'boolean',
+    signgittag: 'boolean',
+    strictpeerdeps: 'boolean',
+    strictssl: 'boolean',
+    timing: 'boolean',
+    unicode: 'boolean',
+    updatenotifier: 'boolean',
+    usage: 'boolean',
+    version: 'boolean',
+    versions: 'boolean',
+    workspacesupdate: 'boolean',
+    diffunified: 'number',
+    fetchretries: 'number',
+    fetchretryfactor: 'number',
+    fetchretrymaxtimeout: 'number',
+    fetchretrymintimeout: 'number',
+    fetchtimeout: 'number',
+    logsmax: 'number',
+    maxsockets: 'number',
+    searchlimit: 'number',
+    searchstaleness: 'number',
+    ssopollfrequency: 'number',
+    timeout: 'number',
+  }
+
+  /** Parses a string to a boolean. */
+  const stringToBoolean = (s: string): boolean => !!s && s !== 'false' && s !== '0'
+
+  /** Parses a string to a number. */
+  const stringToNumber = (s: string): number => parseInt(s) || 0
+
+  // needed until pacote supports full npm config compatibility
+  // See: https://github.com/zkat/pacote/issues/156
+  const config: NpmConfig = keyValueBy(npmConfig, (rawKey: string, value: NpmConfig[keyof NpmConfig]) => {
+    // npm expands env ${VARS} in keys too, so an auth key like //host/${PROJECT_ID}/:_authToken matches its registry
+    const key = interpolate(rawKey, process.env)
+
+    // replace env ${VARS} in strings with the process.env value
+    const normalizedValue =
+      typeof value !== 'string'
+        ? value
+        : // parse stringified booleans
+          keyTypes[key.replace(/-/g, '').toLowerCase()] === 'boolean'
+          ? stringToBoolean(value)
+          : keyTypes[key.replace(/-/g, '').toLowerCase()] === 'number'
+            ? stringToNumber(value)
+            : interpolate(value, process.env)
+
+    // normalize the key for pacote
+    const { [key]: pacoteKey }: Index<NpmConfig[keyof NpmConfig]> = npmConfigToPacoteMap
+
+    return typeof pacoteKey === 'string'
+      ? // key is mapped to a string
+        { [pacoteKey]: normalizedValue }
+      : // key is mapped to a function
+        typeof pacoteKey === 'function'
+        ? { ...(pacoteKey(normalizedValue.toString()) as any) }
+        : // otherwise assign the camel-cased key
+          { [key.match(/^[a-z]/i) ? camelCase(key) : key]: normalizedValue }
+  })
+
+  return config
+}
+
+interface NpmApi {
+  fetchUpgradedPackumentMemo: (
+    packageName: string,
+    fields: (keyof Packument)[],
+    currentVersion: Version,
+    options: Options,
+    retried?: number,
+    npmConfigLocal?: NpmConfig,
+    npmConfigWorkspaceProject?: NpmConfig,
+  ) => Promise<Partial<Packument> | undefined>
+  findNpmConfig: () => NpmConfig
+  mockFetchUpgradedPackument: (mockReturnedVersions: MockedVersions) => typeof fetchUpgradedPackument
+}
+
+/**
+ * ES Modules cannot be stubbed.
+ * To allow stubbing of npm functions in tests, we export the functions that
+ * need to be stubbed as properties of an object (npmApi) that can be
+ * imported and stubbed in tests without affecting the rest of the module.
+ */
+export const npmApi = {} as NpmApi
+
+/** Parses the .npmrc at the given path (project- and cwd-level). Returns null if it does not exist. */
+const parseNpmrc = memoize((configPath: string): NpmConfig | null => {
+  let config
+  try {
+    const data = fs.readFileSync(configPath, 'utf-8')
+    config = ini.parse(data)
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      return null
+    } else {
+      throw err
+    }
+  }
+
+  return normalizeNpmConfig(config, configPath)
+})
+
+/** Reads and parses an .npmrc file, returning {} if it does not exist. */
+const readNpmrc = (file: string): NpmConfig => {
+  try {
+    return ini.parse(fs.readFileSync(file, 'utf-8'))
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return {}
+    throw err
+  }
+}
+
+/** Returns the global npm prefix, used to locate the global npmrc. */
+const getGlobalPrefix = (): string => {
+  if (process.env.PREFIX) return process.env.PREFIX
+  // c:\node\node.exe -> c:\node
+  if (process.platform === 'win32') return path.dirname(process.execPath)
+  // /usr/local/bin/node -> /usr/local
+  const prefix = path.dirname(path.dirname(process.execPath))
+  return process.env.DESTDIR ? path.join(process.env.DESTDIR, prefix) : prefix
+}
+
+/** Reads and merges the global, user, and project .npmrc files plus npm_config_* env vars. Memoized so it loads once. */
+npmApi.findNpmConfig = memoize((): NpmConfig => {
+  const envPrefix = /^npm_config_/i
+  const env: NpmConfig = {}
+
+  for (const key of Object.keys(process.env)) {
+    if (!envPrefix.test(key)) continue
+
+    const normalizedKey = key
+      .toLowerCase()
+      .replace(envPrefix, '')
+      .replace(/(?!^)_/g, '-')
+    env[normalizedKey] = process.env[key] as string
+  }
+
+  const userconfig =
+    process.env.npm_config_userconfig ||
+    process.env.NPM_CONFIG_USERCONFIG ||
+    path.join(process.env.HOME || os.homedir(), '.npmrc')
+  const globalconfig = path.join(getGlobalPrefix(), 'etc', 'npmrc')
+  const global = readNpmrc(globalconfig)
+  const user = readNpmrc(userconfig)
+  const projectConfigPath = findUpSync(['npmrc', '.npmrc'])
+  const project = projectConfigPath && projectConfigPath !== userconfig ? readNpmrc(projectConfigPath) : {}
+
+  // precedence (low to high): global < user < project < env
+  return normalizeNpmConfig({ ...global, ...user, ...project, ...env, cache: false })
+})
+
+/**
+ * Parse JSON and throw an informative error on failure.
+ *
+ * @param result Data to be parsed
+ * @param data
+ * @returns
+ */
+export function parseJson<R>(result: string, data: { command?: string; packageName?: string; stderr?: string }): R {
+  let json
+  try {
+    json = JSON.parse(result)
+  } catch (err) {
+    const stderr = data.stderr?.trim()
+    throw new Error(
+      `Expected JSON from "${data.command}".${
+        data.packageName ? ` There could be problems with the ${data.packageName} package.` : ''
+      } ${result ? 'Instead received: ' + result : 'Received empty response.'}${stderr ? `\n\n${stderr}` : ''}`,
+      { cause: err },
+    )
+  }
+  return json
+}
+
+/** Returns true if an object is a Packument. */
+const isPackument = (o: any): o is Partial<Packument> => !!(o && (o.name || o.engines || o.version || o.versions))
+
+/** Creates a function with the same signature as fetchUpgradedPackument that always returns the given versions. */
+npmApi.mockFetchUpgradedPackument =
+  (mockReturnedVersions: MockedVersions): typeof fetchUpgradedPackument =>
+  (name: string, fields: (keyof Packument)[], currentVersion: Version, options: Options) => {
+    // a partial Packument
+    const partialPackument =
+      typeof mockReturnedVersions === 'function'
+        ? mockReturnedVersions(options)?.[name]
+        : typeof mockReturnedVersions === 'string' || isPackument(mockReturnedVersions)
+          ? mockReturnedVersions
+          : mockReturnedVersions[name]
+
+    const version = isPackument(partialPackument) ? partialPackument.version : partialPackument
+
+    if (!version) {
+      throw new Error(
+        `fetchUpgradedPackument is mocked, but no mock version was supplied for ${name}. Make sure that all dependencies are mocked. `,
+      )
+    }
+
+    const time =
+      isPackument(partialPackument) && partialPackument.time
+        ? partialPackument.time?.[version]
+        : new Date().toISOString()
+    const packument: Packument = {
+      name,
+      'dist-tags': {
+        [options.distTag || 'latest']: version,
+      },
+      engines: { node: '' },
+      time: {
+        [version]: time,
+      },
+      version,
+      // overwritten below
+      versions: {},
+      ...(isPackument(partialPackument) ? partialPackument : null),
+    }
+
+    const { versions: _, ...packumentWithoutVersions } = packument
+
+    return Promise.resolve({
+      ...packument,
+      versions: {
+        ...((isPackument(partialPackument) && partialPackument.versions) || {
+          [version]: packumentWithoutVersions,
+        }),
+      },
+    })
+  }
+
+/** Merges the workspace, global, user, local, project, and cwd npm configs (in that order). */
+// Note that this is memoized on configs and options, but not on package name. This avoids
+// duplicate messages when log level is verbose. parseNpmrc is memoized on config path, so
+// it is not expensive to call multiple times.
+const mergeNpmConfigs = memoize(
+  (
+    {
+      npmConfigLocal,
+      npmConfigUser,
+      npmConfigWorkspaceProject,
+    }: {
+      npmConfigLocal?: NpmConfig
+      npmConfigUser?: NpmConfig
+      npmConfigWorkspaceProject?: NpmConfig
+    },
+    options: Options,
+  ) => {
+    // merge project npm config with base config
+    const npmConfigProjectPath = options.packageFile ? path.join(options.packageFile, '../.npmrc') : undefined
+    const npmConfigProject = npmConfigProjectPath ? parseNpmrc(npmConfigProjectPath) : null
+    const npmConfigCWDPath = options.cwd ? path.join(options.cwd, '.npmrc') : undefined
+    const npmConfigCWD = npmConfigCWDPath ? parseNpmrc(npmConfigCWDPath) : null
+
+    /** Prints a config layer, omitting cache since it is added to every config. */
+    const printNpmConfig = (label: string, config: Record<string, unknown> | null | undefined) => {
+      if (!config || Object.keys(config).length === 0) return
+      print(options, `\n${label}:`, 'verbose')
+      const { cache: _, ...configWithoutCache } = config
+      printSorted(options, configWithoutCache, 'verbose')
+    }
+
+    printNpmConfig('npm config (workspace project)', npmConfigWorkspaceProject)
+    printNpmConfig('npm config (user)', npmConfigUser)
+    printNpmConfig('npm config (local override)', npmConfigLocal)
+    printNpmConfig(`npm config (project: ${npmConfigProjectPath})`, npmConfigProject)
+    printNpmConfig(`npm config (cwd: ${npmConfigCWDPath})`, npmConfigCWD)
+
+    const npmConfigMerged = {
+      ...npmConfigWorkspaceProject,
+      ...npmConfigUser,
+      ...npmConfigLocal,
+      ...npmConfigProject,
+      ...npmConfigCWD,
+      ...(options.registry ? { registry: options.registry, silent: true } : null),
+      ...(options.timeout ? { timeout: options.timeout } : null),
+    }
+
+    const isMerged = npmConfigWorkspaceProject || npmConfigLocal || npmConfigProject || npmConfigCWD
+    if (isMerged) {
+      printNpmConfig('merged npm config', npmConfigMerged)
+    }
+
+    return npmConfigMerged
+  },
+)
+
+/**
+ * Check if package author changed between current and upgraded version.
+ *
+ * @param packageName Name of the package
+ * @param currentVersion Current version declaration (may be range)
+ * @param upgradedVersion Upgraded version declaration (may be range)
+ * @param npmConfigLocal Additional npm config variables that are merged into the system npm config
+ * @returns A promise that fulfills with boolean value.
+ */
+export async function packageAuthorChanged(
+  packageName: string,
+  currentVersion: VersionSpec,
+  upgradedVersion: VersionSpec,
+  options: Options = {},
+  npmConfigLocal?: NpmConfig,
+  npmConfigWorkspaceProject?: NpmConfig,
+): Promise<boolean> {
+  const npmConfig = npmApi.findNpmConfig()
+  // merge the project/cwd .npmrc so a scoped private registry is respected, like the main fetch path
+  const npmConfigMerged = mergeNpmConfigs(
+    { npmConfigUser: { ...npmConfig, fullMetadata: true }, npmConfigLocal, npmConfigWorkspaceProject },
+    options,
+  )
+  const result = await fetchPartialPackument(packageName, ['versions'], null, npmConfigMerged)
+  if (result.versions) {
+    const pkgVersions = Object.keys(result.versions)
+    const current = nodeSemver.minSatisfying(pkgVersions, currentVersion)
+    const upgraded = nodeSemver.maxSatisfying(pkgVersions, upgradedVersion)
+    if (current && upgraded && result.versions[current]._npmUser && result.versions[upgraded]._npmUser) {
+      const currentAuthor = result.versions[current]._npmUser?.name
+      const latestAuthor = result.versions[upgraded]._npmUser?.name
+      return currentAuthor !== latestAuthor
+    }
+  }
+
+  return false
+}
+
+/**
+ * Returns an object of specified values retrieved by npm view.
+ *
+ * @param packageName   Name of the package
+ * @param fields        Array of fields like versions, time, version
+ * @param               currentVersion
+ * @returns             dist-tags field return Index<Packument>, time field returns Index<Index<string>>>, versions field returns Index<Index<Packument>>
+ */
+async function fetchUpgradedPackument(
+  packageName: string,
+  fields: (keyof Packument)[],
+  currentVersion: Version,
+  options: Options,
+  retried = 0,
+  npmConfigLocal?: NpmConfig,
+  npmConfigWorkspaceProject?: NpmConfig,
+): Promise<Partial<Packument> | undefined> {
+  // See: /test/helpers/stubVersions
+  const _stubKey = `STUB_VERSIONS_${process.env.VITEST_POOL_ID ?? '0'}`
+  if (process.env[_stubKey]) {
+    const mockReturnedVersions = JSON.parse(process.env[_stubKey]!)
+    return npmApi.mockFetchUpgradedPackument(mockReturnedVersions)(packageName, fields, currentVersion, options)
+  }
+
+  if (isUnfetchable(currentVersion)) {
+    return {}
+  }
+
+  // fields may already include time
+  const fieldsExtended: (keyof Packument)[] =
+    options.format?.includes('time') && !fields.includes('time') ? [...fields, 'time'] : fields
+  const fullMetadata = fieldsExtended.includes('time')
+
+  const npmConfig = npmApi.findNpmConfig()
+  const npmConfigMerged = mergeNpmConfigs(
+    {
+      npmConfigUser: { ...npmConfig, fullMetadata },
+      npmConfigLocal,
+      npmConfigWorkspaceProject,
+    },
+    options,
+  )
+
+  let result: Partial<Packument> | undefined
+  try {
+    const tag = options.distTag || 'latest'
+
+    // when a single tag is requested, its manifest exposes deprecated without the whole versions map
+    if (options.distTag && !options.deprecated && !fullMetadata && fields.length === 1 && fields[0] === 'dist-tags') {
+      const manifest = await fetchTagManifest(packageName, tag, npmConfigMerged)
+      if (manifest) return manifest
+
+      // the manifest is missing both when the tag does not exist and when the registry does not
+      // serve manifests, so resolve the tag before paying for the versions map
+      const distTags = await fetchPartialPackument(packageName, ['dist-tags'], tag, npmConfigMerged)
+      if (!distTags['dist-tags']?.[tag]) return distTags
+    }
+
+    result = await fetchPartialPackument(
+      packageName,
+      Array.from(
+        new Set([
+          'dist-tags',
+          ...fields,
+          // deprecated and engines are only set on entries of versions, not on the packument itself
+          ...(!options.deprecated || options.enginesNode ? (['versions'] as const) : []),
+        ]),
+      ),
+      fullMetadata ? null : tag,
+      npmConfigMerged,
+    )
+  } catch (err: any) {
+    if (options.retry && ++retried <= options.retry) {
+      return fetchUpgradedPackument(
+        packageName,
+        fieldsExtended,
+        currentVersion,
+        options,
+        retried,
+        npmConfigLocal,
+        npmConfigWorkspaceProject,
+      )
+    }
+
+    throw err
+  }
+
+  return result
+}
+
+/** Memoize fetchUpgradedPackument for --deep and --workspaces performance. */
+// must be exported to stub
+npmApi.fetchUpgradedPackumentMemo = memoize(fetchUpgradedPackument, {
+  // serializer args are incorrectly typed as any[] instead of being generic, so we need to cast it
+  serializer: (([
+    packageName,
+    fields,
+    currentVersion,
+    options,
+    retried,
+    npmConfigLocal,
+    npmConfigWorkspaceProject,
+  ]: Parameters<typeof fetchUpgradedPackument>) => {
+    // packageFile varies by cwd in workspaces/deep mode, so we do not want to memoize on that
+    const { packageFile: _, ...optionsWithoutPackageFile } = options
+    return JSON.stringify([
+      packageName,
+      fields,
+      // currentVersion only changes the behavior of fetchUpgradedPackument when it short circuits
+      isUnfetchable(currentVersion),
+      optionsWithoutPackageFile,
+      // make sure retries do not get memoized
+      retried,
+      npmConfigLocal,
+      npmConfigWorkspaceProject,
+    ])
+  }) as (args: any[]) => string,
+})
+
+/**
+ * Spawns npm with --json. Handles different commands for Window and Linux/OSX.
+ *
+ * @param args
+ * @param [npmOptions={}]
+ * @param [spawnOptions={}]
+ * @returns
+ */
+async function spawnNpm(
+  args: string | string[],
+  npmOptions: NpmOptions = {},
+  spawnPleaseOptions: SpawnPleaseOptions = {},
+  spawnOptions: Index<any> = {},
+): Promise<SpawnResult> {
+  const fullArgs = [
+    ...(npmOptions.global ? [`--global`] : []),
+    ...(npmOptions.prefix ? [`--prefix=${npmOptions.prefix}`] : []),
+    '--json',
+    ...(Array.isArray(args) ? args : [args]),
+  ]
+
+  return spawnCommand('npm', fullArgs, spawnPleaseOptions, spawnOptions)
+}
+
+/**
+ * Get platform-specific default prefix to pass on to npm.
+ *
+ * @param options
+ * @param [options.global]
+ * @param [options.prefix]
+ * @returns
+ */
+export async function defaultPrefix(options: Options): Promise<string | undefined> {
+  if (options.prefix) {
+    return options.prefix
+  }
+
+  let prefix: string | undefined
+
+  // catch spawn error which can occur on Windows
+  // https://github.com/raineorshine/npm-check-updates/issues/703
+  try {
+    const { stdout } = await spawnCommand('npm', ['config', 'get', 'prefix'])
+    prefix = stdout
+  } catch (e) {
+    print(
+      options,
+      'Error executing `npm config get prefix`. Caught and ignored. Unsolved: https://github.com/raineorshine/npm-check-updates/issues/703. ERROR: ' +
+        (e instanceof Error ? e.message : String(e)),
+      'verbose',
+      'error',
+    )
+  }
+
+  // FIX: for ncu -g doesn't work on homebrew or windows #146
+  // https://github.com/raineorshine/npm-check-updates/issues/146
+  return options.global && prefix?.match('Cellar')
+    ? '/usr/local'
+    : // Workaround: get prefix on windows for global packages
+      // Only needed when using npm api directly
+      process.platform === 'win32' && options.global && !process.env.prefix
+      ? prefix
+        ? prefix.trim()
+        : `${process.env.AppData}\\npm`
+      : undefined
+}
+
+/** Fetches the packument versions and builds the info shared by every version target. */
+const fetchVersions = async (
+  packageName: string,
+  currentVersion: string,
+  options: Options,
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+) => {
+  const fields: (keyof Packument)[] = ['versions']
+
+  if (options.cooldown) {
+    fields.push('time')
+  }
+
+  const packument = await npmApi.fetchUpgradedPackumentMemo(
+    packageName,
+    fields,
+    currentVersion,
+    options,
+    0,
+    npmConfig,
+    npmConfigProject,
+  )
+
+  const versions = Object.values(packument?.versions ?? {})
+  return { packument, packageInfo: { packageName, currentVersion, options, versions, time: packument?.time } }
+}
+
+/**
+ * Fetches the highest version number, regardless of tag or publish time.
+ *
+ * @param packageName
+ * @param currentVersion
+ * @param options
+ * @returns
+ */
+export const greatest: GetVersion = async (
+  packageName,
+  currentVersion,
+  options = {},
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+  caller?: 'distTag' | 'latest',
+): Promise<VersionResult> => {
+  const { packument, packageInfo } = await fetchVersions(
+    packageName,
+    currentVersion,
+    options,
+    npmConfig,
+    npmConfigProject,
+  )
+
+  const versionResult = findTargetAndFallback(packageInfo)
+
+  if (caller) {
+    const version = versionResult.targetBlockedByCooldown ? versionResult.fallbackVersion : versionResult.targetVersion
+    return {
+      version,
+      ...(version && packument?.time?.[version] ? { time: packument.time[version] } : null),
+    }
+  }
+
+  return toVersionResult({ ...packageInfo, ...versionResult })
+}
+
+/**
+ * Fetches the list of peer dependencies for a specific package version.
+ *
+ * @param packageName
+ * @param version   An exact version or a range, in which case the highest matching version is used.
+ * @param options
+ * @returns Promised {packageName: version} collection
+ */
+export const getPeerDependencies = async (
+  packageName: string,
+  version: Version,
+  options: Options = {},
+  npmConfigLocal?: NpmConfig,
+): Promise<Index<Version>> => {
+  const npmConfig = npmApi.findNpmConfig()
+  // merge the project/cwd .npmrc so a scoped private registry is respected, like the main fetch path
+  const npmConfigMerged = mergeNpmConfigs({ npmConfigUser: { ...npmConfig }, npmConfigLocal }, options)
+
+  // an exact version can be read straight from the version manifest
+  if (nodeSemver.valid(version)) {
+    const manifest = await fetchPartialPackument(packageName, ['peerDependencies'], null, npmConfigMerged, version)
+    return manifest.peerDependencies || {}
+  }
+
+  // a range needs the version list to resolve the highest match, matching `npm view pkg@range`
+  const packument = await fetchPartialPackument(packageName, ['versions'], null, npmConfigMerged)
+  const resolved = nodeSemver.maxSatisfying(Object.keys(packument.versions ?? {}), version)
+  return (resolved && packument.versions?.[resolved]?.peerDependencies) || {}
+}
+
+/**
+ * Fetches all dist-tags published for a package.
+ *
+ * @param packageName
+ * @returns Promised {tag: version} collection
+ */
+export const getDistTags = async (
+  packageName: string,
+  options: Options = {},
+  npmConfigLocal?: NpmConfig,
+  npmConfigWorkspaceProject?: NpmConfig,
+): Promise<Index<Version>> => {
+  // currentVersion is only used to short circuit unfetchable specs, which does not apply here.
+  // distTag is cleared because every tag is needed here, not just the one being upgraded to.
+  const packument = await npmApi.fetchUpgradedPackumentMemo(
+    packageName,
+    ['dist-tags'],
+    '',
+    { ...options, distTag: undefined },
+    0,
+    npmConfigLocal,
+    npmConfigWorkspaceProject,
+  )
+  return packument?.['dist-tags'] || {}
+}
+
+/**
+ * Fetches the engines list from the registry for a specific package version.
+ *
+ * @param packageName
+ * @param version
+ * @returns Promised engines collection
+ */
+export const getEngines = async (
+  packageName: string,
+  version: Version,
+  options: Options = {},
+  npmConfigLocal?: NpmConfig,
+  npmConfigWorkspaceProject?: NpmConfig,
+): Promise<Index<VersionSpec | undefined>> => {
+  const npmConfig = npmApi.findNpmConfig()
+  // merge the project/cwd .npmrc so a scoped private registry is respected, like the main fetch path
+  const npmConfigMerged = mergeNpmConfigs(
+    { npmConfigUser: { ...npmConfig }, npmConfigLocal, npmConfigWorkspaceProject },
+    options,
+  )
+  const result = await fetchPartialPackument(packageName, [`engines`], null, npmConfigMerged, version)
+  return result.engines || {}
+}
+
+/**
+ * Fetches the list of all installed packages.
+ *
+ * @param [options]
+ * @param [options.cwd]
+ * @param [options.global]
+ * @param [options.prefix]
+ * @returns
+ */
+export const list = async (options: Options = {}): Promise<Index<string | undefined>> => {
+  // npm ls exits non-zero on tree problems (e.g. unmet peers) but still prints usable JSON
+  const { stdout, stderr, command } = await spawnNpm(
+    ['ls', '--depth=0'],
+    {
+      ...(options.global ? { global: true } : null),
+      ...(options.prefix ? { prefix: options.prefix } : null),
+    },
+    {
+      rejectOnError: false,
+    },
+    {
+      ...(options.cwd ? { cwd: options.cwd } : null),
+    },
+  )
+  const dependencies = parseJson<{
+    dependencies: Index<{ version?: Version; required?: { version: Version } }>
+  }>(stdout, { command, stderr }).dependencies
+
+  return keyValueBy(dependencies, (name, info) => ({
+    // unmet peer dependencies have a different structure
+    [name]: info.version || info.required?.version,
+  }))
+}
+
+/**
+ * Fetches the version of a package published to options.distTag.
+ *
+ * @param packageName
+ * @param currentVersion
+ * @param options
+ * @returns
+ */
+export const distTag: GetVersion = async (
+  packageName,
+  currentVersion,
+  options: Options = {},
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+) => {
+  const fields: (keyof Packument)[] = ['dist-tags']
+
+  if (options.cooldown) {
+    fields.push('time')
+  }
+
+  const packument = await npmApi.fetchUpgradedPackumentMemo(
+    packageName,
+    fields,
+    currentVersion,
+    options,
+    0,
+    npmConfig,
+    npmConfigProject,
+  )
+
+  const version = packument?.['dist-tags']?.[options.distTag || 'latest']
+  // skip packages with a missing or bogus dist-tag to prevent resolution errors
+  if (!isCleanVersion(version)) {
+    return {}
+  }
+
+  const versionPackument = packument?.versions?.[version]
+
+  // fall back to a minimal packument when versions was not fetched, or when the registry does not
+  // list the version that dist-tags points to
+  const tagPackument = versionPackument ?? {
+    name: packageName,
+    version,
+  }
+
+  // the deprecated and engines filters read fields that only exist on the real version object, so a
+  // fallback packument would pass them unchecked. fall through to greatest instead.
+  const isUnfilterable = !versionPackument && (!options.deprecated || options.enginesNode)
+
+  const publishTime = packument?.time?.[version!]
+  const maybeTime = publishTime ? { time: publishTime } : null
+  const current = (nodeSemver.validRange(currentVersion) && nodeSemver.minVersion(currentVersion)?.version) || '0.0.0'
+
+  const isSatisfiesCooldown =
+    tagPackument.version === current ||
+    satisfiesCooldownPeriod(packageName, tagPackument.version, publishTime, options.cooldown)
+
+  // latest should not be deprecated
+  // if latest exists and latest is not a prerelease version, return it
+  // if latest exists and latest is a prerelease version and --pre is specified, return it
+  // if latest exists and latest not satisfies min version of engines.node
+  // if latest exists and cooldown is specified and latest is within cooldown period, return it
+  if (isSatisfiesCooldown && !isUnfilterable && filterPredicate(options)(tagPackument)) {
+    return {
+      version: tagPackument.version,
+      ...maybeTime,
+    }
+  }
+
+  // only report cooldown when the version is actually within it; a version rejected by another
+  // filter (pre, deprecated, engines, peer) falls through to greatest instead
+  if (options.cooldown && !isSatisfiesCooldown) {
+    print(
+      options,
+      `Skipping ${packageName}@${version} due to cooldown${
+        publishTime ? ` (published ${sanitizeForDisplay(publishTime)})` : ''
+      }.`,
+      'verbose',
+    )
+
+    return {
+      cooldownInfo: {
+        name: packageName,
+        currentVersion,
+        currentVersionTime: packument?.time?.[current],
+        version: tagPackument.version,
+        ...maybeTime,
+      },
+    }
+  }
+
+  // If we use a custom dist-tag, we do not want to get other 'pre' versions, just the ones from this dist-tag
+  if (options.distTag && options.distTag !== 'latest') return {}
+
+  // if latest is a prerelease version and --pre is not specified
+  // or latest is deprecated
+  // find the next valid version
+  return greatest(packageName, currentVersion, options, npmConfig, npmConfigProject, 'distTag')
+}
+
+/**
+ * Fetches the version published to the latest tag.
+ *
+ * @param packageName
+ * @param currentVersion
+ * @param options
+ * @returns
+ */
+export const latest: GetVersion = async (
+  packageName: string,
+  currentVersion: Version,
+  options: Options = {},
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+): Promise<VersionResult> => {
+  const latestResult = await distTag(
+    packageName,
+    currentVersion,
+    { ...options, distTag: 'latest' },
+    npmConfig,
+    npmConfigProject,
+  )
+
+  if (latestResult.cooldownInfo) {
+    const fallback = await greatest(packageName, currentVersion, options, npmConfig, npmConfigProject, 'latest')
+    if (fallback.version) {
+      latestResult.cooldownInfo.fallbackVersion = fallback.version
+      return {
+        ...fallback,
+        ...latestResult,
+      }
+    }
+  }
+
+  return latestResult
+}
+
+/**
+ * Fetches the most recently published version, regardless of version number.
+ *
+ * @param packageName
+ * @param currentVersion
+ * @param options
+ * @returns
+ */
+export const newest: GetVersion = async (
+  packageName,
+  currentVersion,
+  options = {},
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+): Promise<VersionResult> => {
+  const packument = await npmApi.fetchUpgradedPackumentMemo(
+    packageName,
+    ['time', 'versions'],
+    currentVersion,
+    options,
+    0,
+    npmConfig,
+    npmConfigProject,
+  )
+
+  const versions = Object.values(packument?.versions ?? {})
+  const time = packument?.time
+  const isTimeMissing = !time || Object.keys(time).length === 0
+  const packageInfo = { packageName, currentVersion, options, versions, time }
+
+  const versionResult = isTimeMissing
+    ? {
+        targetVersion: currentVersion,
+        fallbackVersion: null,
+        targetBlockedByCooldown: false,
+      }
+    : findTargetAndFallback({
+        ...packageInfo,
+        compare: (v1, v2) => {
+          const t1 = packument?.time?.[v1] || ''
+          const t2 = packument?.time?.[v2] || ''
+          return t1 > t2 ? 1 : t1 < t2 ? -1 : 0
+        },
+      })
+
+  return toVersionResult({ ...packageInfo, ...versionResult })
+}
+
+/**
+ * Fetches the highest version with the same major version as currentVersion.
+ *
+ * @param packageName
+ * @param currentVersion
+ * @param options
+ * @returns
+ */
+export const minor: GetVersion = async (
+  packageName,
+  currentVersion,
+  options = {},
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+): Promise<VersionResult> => {
+  const { packageInfo } = await fetchVersions(packageName, currentVersion, options, npmConfig, npmConfigProject)
+
+  const versionResult = findTargetAndFallback({
+    ...packageInfo,
+    filter: versionUtil.filterByLevel(currentVersion, 'minor'),
+  })
+
+  return toVersionResult({ ...packageInfo, ...versionResult })
+}
+
+/**
+ * Fetches the highest version with the same minor and major version as currentVersion.
+ *
+ * @param packageName
+ * @param currentVersion
+ * @param options
+ * @returns
+ */
+export const patch: GetVersion = async (
+  packageName,
+  currentVersion,
+  options = {},
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+): Promise<VersionResult> => {
+  const { packageInfo } = await fetchVersions(packageName, currentVersion, options, npmConfig, npmConfigProject)
+
+  const versionResult = findTargetAndFallback({
+    ...packageInfo,
+    filter: versionUtil.filterByLevel(currentVersion, 'patch'),
+  })
+
+  return toVersionResult({ ...packageInfo, ...versionResult })
+}
+
+/**
+ * Fetches the highest version that satisfies the semver range specified in the package.json.
+ *
+ * @param packageName
+ * @param currentVersion
+ * @param options
+ * @returns
+ */
+export const semver: GetVersion = async (
+  packageName,
+  currentVersion,
+  options = {},
+  npmConfig?: NpmConfig,
+  npmConfigProject?: NpmConfig,
+): Promise<VersionResult> => {
+  // ignore explicit version ranges (e.g. `>1`, `1 || 2`, `1.0.0 - 1.3.0`) since there is no clear
+  // upgrade target, but still upgrade caret/tilde ranges that carry an explicit upper bound
+  // (e.g. `^9.5.0 <10`), staying within the declared range
+  if (isExplicitRange(currentVersion) && !hasCaretOrTilde(currentVersion)) return { version: null }
+
+  const { packageInfo } = await fetchVersions(packageName, currentVersion, options, npmConfig, npmConfigProject)
+
+  const versionResult = findTargetAndFallback({
+    ...packageInfo,
+    filter: versionUtil.filterBySatisfying(currentVersion),
+  })
+
+  return toVersionResult({ ...packageInfo, ...versionResult })
+}
+
+/** Reads npm's min-release-age config as a cooldown. Also used for package managers with no native setting. */
+export const getCooldown = async (): Promise<NativeCooldown | null> => {
+  const config = npmApi.findNpmConfig()
+  const minReleaseAge = config?.minReleaseAge
+  if (minReleaseAge == null) return null
+
+  const days =
+    typeof minReleaseAge === 'string'
+      ? (parseCooldown(minReleaseAge) ?? parseInt(minReleaseAge, 10))
+      : typeof minReleaseAge === 'number'
+        ? minReleaseAge
+        : null
+  if (days == null || isNaN(days)) return null
+
+  // npm's min-release-age-exclude is a list of package names or glob patterns that are exempt from min-release-age.
+  // a single .npmrc entry parses as a string; repeated entries (min-release-age-exclude[]=) parse as an array.
+  const excludeRaw = config?.minReleaseAgeExclude
+  const exclude = [
+    ...new Set(
+      (Array.isArray(excludeRaw) ? excludeRaw : typeof excludeRaw === 'string' ? [excludeRaw] : [])
+        .flatMap(pattern => pattern.split(','))
+        .map(pattern => pattern.trim())
+        .filter(pattern => pattern),
+    ),
+  ]
+
+  return {
+    days,
+    exclude,
+    source: 'min-release-age from .npmrc',
+    excludeLabel: 'excluded pattern',
+    createMatcher: pattern => {
+      const match = picomatch(pattern, { nonegate: true, noext: true })
+      return packageName => packageName === pattern || match(packageName)
+    },
+  }
+}
+
+export { spawnNpm as spawn }
+
+export default spawnNpm

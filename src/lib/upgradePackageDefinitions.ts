@@ -1,0 +1,186 @@
+import { isDeepStrictEqual } from 'node:util'
+import semver from 'semver'
+import { parse, parseRange } from 'semver-utils'
+import { type Index } from '../types/IndexType.ts'
+import { type Options } from '../types/Options.ts'
+import { type VersionResult } from '../types/VersionResult.ts'
+import { type VersionSpec } from '../types/VersionSpec.ts'
+import getPeerDependenciesFromRegistry from './getPeerDependenciesFromRegistry.ts'
+import keyValueBy from './keyValueBy.ts'
+import { pickBy } from './pick.ts'
+import queryVersions from './queryVersions.ts'
+import upgradeDependencies from './upgradeDependencies.ts'
+
+type CheckIfInPeerViolationResult = {
+  violated: boolean
+  filteredUpgradedDependencies: Index<VersionSpec>
+  upgradedPeerDependencies: Index<Index<VersionSpec>>
+}
+
+/**
+ * Check if the peer dependencies constraints of each upgraded package, are in violation,
+ * thus rendering the upgrade to be invalid
+ *
+ * @returns Whether there was any violation, and the upgrades that are not in violation
+ */
+const checkIfInPeerViolation = (
+  currentDependencies: Index<VersionSpec>,
+  filteredUpgradedDependencies: Index<VersionSpec>,
+  upgradedPeerDependencies: Index<Index<VersionSpec>>,
+): CheckIfInPeerViolationResult => {
+  const upgradedDependencies = { ...currentDependencies, ...filteredUpgradedDependencies }
+  const filteredUpgradedDependenciesAfterPeers = pickBy(filteredUpgradedDependencies, (spec, dep) => {
+    const peerDeps = upgradedPeerDependencies[dep]
+    if (!peerDeps) {
+      return true
+    }
+    return Object.entries(peerDeps).every(
+      ([peer, peerSpec]) =>
+        upgradedDependencies[peer] === undefined ||
+        !semver.validRange(peerSpec) ||
+        // Non-semver specs like catalog: references cannot be compared; treat as compatible
+        !semver.validRange(upgradedDependencies[peer]) ||
+        semver.intersects(upgradedDependencies[peer], peerSpec),
+    )
+  })
+  const violated =
+    Object.keys(filteredUpgradedDependencies).length > Object.keys(filteredUpgradedDependenciesAfterPeers).length
+  let filteredUpgradedPeerDependencies = upgradedPeerDependencies
+  if (violated) {
+    filteredUpgradedPeerDependencies = pickBy(
+      upgradedPeerDependencies,
+      (spec, dep) => filteredUpgradedDependenciesAfterPeers[dep] || !filteredUpgradedDependencies[dep],
+    )
+  }
+  return {
+    violated,
+    filteredUpgradedDependencies: filteredUpgradedDependenciesAfterPeers,
+    upgradedPeerDependencies: filteredUpgradedPeerDependencies,
+  }
+}
+
+/**
+ * Merges a peer recursion pass into the previous one. The recursion requeries at the already
+ * upgraded spec, so a result with no version means nothing more to upgrade to.
+ */
+const mergeVersionResults = (previous: Index<VersionResult>, next: Index<VersionResult>): Index<VersionResult> =>
+  keyValueBy({ ...previous, ...next }, (dep, result) => ({
+    [dep]: !result.version && !result.error && previous[dep]?.version ? previous[dep] : result,
+  }))
+
+export type UpgradePackageDefinitionsResult = [
+  upgradedDependencies: Index<VersionSpec>,
+  latestVersionResults: Index<VersionResult>,
+  newPeerDependencies?: Index<Index<VersionSpec>>,
+]
+
+/**
+ * Returns a 3-tuple of upgradedDependencies, their latest versions and the resulting peer dependencies.
+ *
+ * @param currentDependencies
+ * @param options
+ * @returns
+ */
+export async function upgradePackageDefinitions(
+  currentDependencies: Index<VersionSpec>,
+  options: Options,
+): Promise<UpgradePackageDefinitionsResult> {
+  const latestVersionResults = await queryVersions(currentDependencies, options)
+
+  const latestVersions = keyValueBy(latestVersionResults, (dep, result) =>
+    result?.version &&
+    (!options.filterResults ||
+      options.filterResults(dep, {
+        currentVersion: currentDependencies[dep],
+        currentVersionSemver: parseRange(currentDependencies[dep]),
+        upgradedVersion: result.version,
+        upgradedVersionSemver: parse(result.version),
+      }))
+      ? {
+          [dep]: result.version,
+        }
+      : null,
+  )
+
+  const upgradedDependencies = upgradeDependencies(currentDependencies, latestVersions, options)
+
+  const filteredUpgradedDependencies = pickBy(upgradedDependencies, (v, dep) => {
+    return !options.jsonUpgraded || !options.minimal || !semver.satisfies(latestVersions[dep], currentDependencies[dep])
+  })
+
+  const filteredLatestDependencies = pickBy(latestVersions, (spec, dep) => filteredUpgradedDependencies[dep])
+
+  let result: UpgradePackageDefinitionsResult = [
+    filteredUpgradedDependencies,
+    latestVersionResults,
+    options.peerDependencies,
+  ]
+
+  if (!options.peer || Object.keys(filteredLatestDependencies).length === 0) {
+    return result
+  }
+
+  const upgradedPeerDependencies = await getPeerDependenciesFromRegistry(filteredLatestDependencies, options)
+
+  let checkPeerViolationResult: CheckIfInPeerViolationResult
+
+  if (
+    isDeepStrictEqual(options.peerDependencies, {
+      ...options.peerDependencies,
+      ...upgradedPeerDependencies,
+    })
+  ) {
+    checkPeerViolationResult = checkIfInPeerViolation(
+      currentDependencies,
+      filteredUpgradedDependencies,
+      options.peerDependencies!,
+    )
+    if (!checkPeerViolationResult.violated) {
+      return result
+    }
+  } else {
+    checkPeerViolationResult = {
+      violated: false,
+      filteredUpgradedDependencies,
+      upgradedPeerDependencies,
+    }
+  }
+
+  let runCount = 0
+  do {
+    if (runCount++ > 6) {
+      throw new Error(`Stuck in a while loop. Please report an issue`)
+    }
+    const peerDependenciesAfterUpgrade = {
+      ...options.peerDependencies,
+      ...checkPeerViolationResult.upgradedPeerDependencies,
+    }
+    if (isDeepStrictEqual(options.peerDependencies, peerDependenciesAfterUpgrade)) {
+      // Peers stopped changing; keep the upgrades that do not violate them.
+      // Dropping one upgrade can invalidate another that was kept, so filter until the set settles.
+      let nonViolating = checkPeerViolationResult
+      while (nonViolating.violated) {
+        nonViolating = checkIfInPeerViolation(
+          currentDependencies,
+          nonViolating.filteredUpgradedDependencies,
+          nonViolating.upgradedPeerDependencies,
+        )
+      }
+      return [nonViolating.filteredUpgradedDependencies, latestVersionResults, options.peerDependencies]
+    }
+    const [newUpgradedDependencies, newLatestVersions, newPeerDependencies] = await upgradePackageDefinitions(
+      { ...currentDependencies, ...checkPeerViolationResult.filteredUpgradedDependencies },
+      { ...options, peerDependencies: peerDependenciesAfterUpgrade, loglevel: 'silent' },
+    )
+    result = [
+      { ...checkPeerViolationResult.filteredUpgradedDependencies, ...newUpgradedDependencies },
+      mergeVersionResults(latestVersionResults, newLatestVersions),
+      newPeerDependencies,
+    ]
+    checkPeerViolationResult = checkIfInPeerViolation(currentDependencies, result[0], result[2]!)
+  } while (checkPeerViolationResult.violated)
+
+  return result
+}
+
+export default upgradePackageDefinitions

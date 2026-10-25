@@ -1,0 +1,33 @@
+lib-cov
+*.seed
+*.log
+*.csv
+*.dat
+*.out
+*.pid
+*.gz
+
+pids
+logs
+results
+
+npm-debug.log
+node_modules
+build
+
+.idea
+*.iml
+yarn.lock
+.DS_store
+
+# test files
+/test/temp_package*.json
+/test/.ncurc.json
+
+# doctor test artifacts
+/test/test-data/doctor/**/package-lock.json
+/test/test-data/doctor/**/.yarn/
+/test/test-data/doctor/**/.pnp.js
+
+# Agent files
+.claude

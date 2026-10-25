@@ -1,0 +1,452 @@
+import path from 'node:path'
+import prompts from 'prompts-ncu'
+import { SpawnError } from 'spawn-please'
+import pkg from '../package.json' with { type: 'json' }
+import { cliOptionsMap } from './cli-options.ts'
+import { cacheClear } from './lib/cache.ts'
+import defineConfig from './lib/defineConfig.ts'
+import determinePackageManager from './lib/determinePackageManager.ts'
+import doctor from './lib/doctor.ts'
+import findPackage from './lib/findPackage.ts'
+import getAllPackages from './lib/getAllPackages.ts'
+import getNcuRc from './lib/getNcuRc.ts'
+import initOptions from './lib/initOptions.ts'
+import { errorText, print, printJson } from './lib/logging.ts'
+import mergeOptions from './lib/mergeOptions.ts'
+import parseOptions from './lib/parseOptions.ts'
+import programError from './lib/programError.ts'
+import runGlobal from './lib/runGlobal.ts'
+import runLocal from './lib/runLocal.ts'
+import spawnCommand from './lib/spawnCommand.ts'
+import style, { styleInit } from './lib/style.ts'
+import { type Index } from './types/IndexType.ts'
+import { type Options } from './types/Options.ts'
+import { type PackageFile } from './types/PackageFile.ts'
+import { type PackageInfo } from './types/PackageInfo.ts'
+import { type RunOptions } from './types/RunOptions.ts'
+import { type VersionSpec } from './types/VersionSpec.ts'
+
+/** Tracks the (first) unhandled rejection so the process can exit with an error code at the end. This allows other errors to be logged before the process exits. */
+let unhandledRejectionError = false
+
+let lastRunOptions: Options | null = null
+
+let cliHandlersRegistered = false
+
+/** Registers CLI-only prompt injection and process handlers lazily, so importing the module has no side effects. */
+function registerCliHandlers() {
+  if (cliHandlersRegistered) return
+  cliHandlersRegistered = true
+
+  // allow prompt injection from environment variable for testing purposes
+  if (process.env.INJECT_PROMPTS) {
+    prompts.inject(JSON.parse(process.env.INJECT_PROMPTS))
+  }
+
+  // Use `node --trace-uncaught ...` to show where the exception was thrown.
+  // See: https://nodejs.org/api/process.html#event-unhandledrejection
+  process.on('unhandledRejection', (reason: string | Error) => {
+    // do not rethrow, as there may be other errors to print out
+    // options may not be resolved yet if the rejection happened during startup, so fall back to the defaults
+    print(lastRunOptions ?? {}, errorText(reason), null, 'error')
+
+    // ensure the process exits with a non-zero code at the end
+    unhandledRejectionError = true
+  })
+
+  // ensure that the process exits with an error code if there was an unhandled rejection
+  process.on('exit', () => {
+    if (unhandledRejectionError && lastRunOptions) {
+      programError(lastRunOptions, `Unhandled Rejection! This is a bug and should be reported: ${pkg.bugs.url}`)
+    }
+  })
+}
+
+/**
+ * Volta is a tool for managing JavaScript tooling like Node and npm. Volta has
+ * its own system for installing global packages which circumvents npm, so
+ * commands like `npm ls -g` do not accurately reflect what is installed.
+ *
+ * The ability to use `npm ls -g` is tracked in this Volta issue: https://github.com/volta-cli/volta/issues/1012
+ */
+const noVolta = (options: Options) => {
+  // The first check is for macOS/Linux and the second check is for Windows
+  if (options.global && (!!process.env.VOLTA_HOME || process.env.PATH?.includes('\\Volta'))) {
+    const message =
+      'It appears you are using Volta. `npm-check-updates --global` ' +
+      'cannot be used with Volta because Volta has its own system for ' +
+      'managing global packages which circumvents npm.\n\n' +
+      'If you are still receiving this message after uninstalling Volta, ' +
+      'ensure your PATH does not contain an entry for Volta and your ' +
+      'shell profile does not define VOLTA_HOME. You may need to reboot ' +
+      'for changes to your shell profile to take effect.'
+
+    print(options, message, 'error')
+    process.exit(1)
+  }
+}
+
+/** Returns the package manager that should be used to install packages after running "ncu -u". Uses the same detection logic as the main package manager determination. */
+const getPackageManagerForInstall = async (options: Options, packageFile: string) => {
+  // create options context for the package file location
+  const installOptions: Options = {
+    ...options,
+    cwd: options.cwd || path.resolve(packageFile, '..'),
+    packageFile,
+  }
+
+  // when packageManager is set to staticRegistry, we need to infer the package manager from lock files
+  if (options.packageManager === 'staticRegistry') {
+    return await determinePackageManager({ ...installOptions, packageManager: undefined })
+  } else if (options.packageManager && options.packageManager !== 'npm') {
+    return options.packageManager
+  }
+
+  // use the same logic as the main package manager detection
+  return await determinePackageManager(installOptions)
+}
+
+/** Returns if analysis contains upgrades. */
+const someUpgraded = (pkgs: string[], analysis: Index<PackageFile> | PackageFile, options: Options) => {
+  // deep mode analysis is of type Index<PackageFile>
+  // non-deep mode analysis is of type <PackageFile>, so we normalize it to Index<PackageFile>
+  const analysisNormalized: Index<PackageFile> =
+    !options.deep && !options.workspaces && !options.workspace
+      ? { [pkgs[0]]: analysis as PackageFile }
+      : (analysis as Index<PackageFile>)
+
+  return Object.values(analysisNormalized).some(upgrades => Object.keys(upgrades).length > 0)
+}
+
+/** Either suggest an install command based on the package manager, or in interactive mode, prompt to auto-install. */
+const install = async (
+  pkgs: string[],
+  analysis: Index<PackageFile> | PackageFile,
+  options: Options,
+): Promise<unknown> => {
+  if (options.install === 'never') {
+    print(options, '')
+    return
+  }
+
+  // if no packages were upgraded (i.e. all dependencies deselected in interactive mode), then bail without suggesting an install.
+  // normalize the analysis for one or many packages
+  if (!someUpgraded(pkgs, analysis, options)) return
+
+  // for the purpose of the install hint, just use the package manager used in the first sub-project
+  // if auto-installing, the actual package manager in each sub-project will be used
+  const packageManager = await getPackageManagerForInstall(options, pkgs[0])
+
+  // by default, show an install hint after upgrading
+  // this will be disabled in interactive mode if the user chooses to have npm-check-updates execute the install command
+  const installHint = `Run ${style.cyan(packageManager + ' install')}${
+    pkgs.length > 1 && !options.workspace && !options.workspaces ? ' in each project directory' : ''
+  } to install new versions`
+
+  // Disable interactive mode when running doctor EXCEPT when running tests.
+  // Otherwise running doctor mode on npm-check-updates itself will cause interactive.test.ts to fail.
+  const isInteractive = options.interactive && (process.env.NCU_TESTS || !process.env.NCU_DOCTOR)
+
+  // prompt the user if they want ncu to run "npm install"
+  let response
+  if (isInteractive && options.install === 'prompt') {
+    print(options, '')
+    response = await prompts({
+      type: 'confirm',
+      name: 'value',
+      message: `${installHint}?`,
+      initial: true,
+      // allow Ctrl+C to kill the process
+      onState: (state: any) => {
+        if (state.aborted) {
+          process.nextTick(() => process.exit(1))
+        }
+      },
+    })
+  }
+
+  // auto-install
+  if (options.install === 'always' || (isInteractive && response.value)) {
+    if (options.install === 'always') {
+      print(options, '')
+    }
+    print(options, 'Installing dependencies...')
+
+    // only run npm install once in the root when in workspace mode
+    // npm install will install packages for all workspaces
+    const isWorkspace = options.workspaces || !!options.workspace?.length
+    const pkgsNormalized = isWorkspace ? ['package.json'] : pkgs
+
+    for (const pkgFile of pkgsNormalized) {
+      const packageManager = await getPackageManagerForInstall(options, pkgFile)
+      const cwd = options.cwd || path.resolve(pkgFile, '..')
+      let stdout = ''
+      try {
+        await spawnCommand(
+          packageManager,
+          ['install'],
+          {
+            stdout: (data: string) => {
+              stdout += data
+            },
+            stderr: (data: string) => {
+              console.error(style.red(data.toString()))
+            },
+          },
+          {
+            cwd,
+            // spawnCommand takes the native SpawnOptions type, but the env property is missing some of the type definitions for environment variables that npm-check-updates uses. Cast to any to allow these extra environment variables.
+            // npm_config_strict_peer_dependencies is expected to be a string for some reason
+            env: {
+              ...process.env,
+              ...(options.color !== false ? { FORCE_COLOR: true } : null),
+              // With spawn, pnpm install will fail with ERR_PNPM_PEER_DEP_ISSUES  Unmet peer dependencies.
+              // When pnpm install is run directly from the terminal, this error does not occur.
+              // When pnpm install is run from a simple spawn script, this error does not occur.
+              // The issue only seems to be when pnpm install is executed from npm-check-updates, but it's not clear what configuration or environmental factors are causing this.
+              // For now, turn off strict-peer-dependencies on pnpm auto-install.
+              // See: https://github.com/raineorshine/npm-check-updates/issues/1191
+              ...(packageManager === 'pnpm' ? { npm_config_strict_peer_dependencies: false } : null),
+            } as any,
+          },
+        )
+        print(options, stdout)
+        print(options, 'Done')
+      } catch (err) {
+        // sometimes packages print errors to stdout instead of stderr
+        // if there is nothing on stderr, print stdout
+        const message = err instanceof Error ? err.message : String(err)
+        const output = err instanceof SpawnError && !err.stderr.trim() && stdout ? stdout : message
+        print(options, errorText(output), null, 'error')
+
+        // use a program error to exit with a non-zero code rather than throwing a new Error and allowing it to bubble up to the "this is a bug and should be reported message".
+        programError(
+          options,
+          'Install failed. This is not a bug in npm-check-updates. The most common causes are invalid peer dependencies, networking issues, or failing postinstall scripts. Consider using --peer to filter updates to compatible versions (takes longer) or --doctor to identify breaking upgrades.',
+        )
+      }
+    }
+  }
+  // show the install hint unless auto-install occurred
+  else if (!isInteractive) {
+    print(options, `\n${installHint}.`)
+  }
+}
+
+/** Runs the dependency upgrades. Loads the ncurc, finds the package file, and handles --deep. */
+async function runUpgrades(
+  options: Options,
+  timeout?: NodeJS.Timeout,
+): Promise<Index<VersionSpec> | PackageFile | void> {
+  const [selectedPackageInfos, workspacePackages]: [PackageInfo[], string[]] = await getAllPackages(options)
+
+  let packageFilepaths: string[] = selectedPackageInfos.map((packageInfo: PackageInfo) => packageInfo.filepath)
+
+  // enable deep mode if --deep, --workspace, --workspaces, or if multiple package files are found
+  const isWorkspace = options.workspaces || !!options.workspace?.length
+  options.deep = options.deep || isWorkspace || selectedPackageInfos.length > 1
+
+  let analysis: Index<PackageFile> | PackageFile | void
+  if (options.global) {
+    const analysis = await runGlobal(options)
+    clearTimeout(timeout)
+    return analysis
+  } else if (options.deep) {
+    const packages: Index<PackageFile> = {}
+    for (const [i, packageInfo] of selectedPackageInfos.entries()) {
+      const isSubsequentPackage = i > 0
+      // copy object to prevent share .ncurc options between different packageFile, to prevent unpredictable behavior
+      const rcResult = await getNcuRc({ packageFile: packageInfo.filepath, options })
+      // parse before merging, otherwise --mergeConfig replaces a root array with a nested raw string
+      let rcConfig = parseOptions(rcResult.config, options)
+      if (options.mergeConfig && Object.keys(rcConfig).length) {
+        // Merge config options.
+        rcConfig = mergeOptions(options, rcConfig)
+      }
+      const pkgOptions: Options = {
+        ...options,
+        ...rcConfig,
+      }
+
+      // cli options take precedence over the reloaded per-package config.
+      // the per-package config still overrides the root config for options not set on the cli.
+      for (const key of options.cliKeys || []) {
+        if (!(key in options)) continue
+        // in --mergeConfig mode, preserve merged arrays rather than replacing them with the cli value alone
+        if (
+          options.mergeConfig &&
+          Array.isArray(pkgOptions[key as keyof Options]) &&
+          Array.isArray(options[key as keyof Options])
+        ) {
+          continue
+        }
+
+        ;(pkgOptions as any)[key] = options[key as keyof Options]
+      }
+
+      pkgOptions.packageFile = packageInfo.filepath
+      pkgOptions.workspacePackages = workspacePackages
+
+      // A catalog entry holds the extracted catalog dependencies rather than the contents of
+      // filepath, so use the PackageInfo data instead of reading from disk.
+      let pkgData: string | null
+      let pkgFile: string
+      let indexKey: string
+
+      if (packageInfo.catalog) {
+        pkgData = packageInfo.pkgFile
+        pkgFile = packageInfo.filepath
+        indexKey = packageInfo.filepath
+
+        // Print the same message as findPackage for consistency
+        const relPathToPackage = path.resolve(indexKey)
+        if (isSubsequentPackage) {
+          print(pkgOptions, '')
+        }
+        print(pkgOptions, `${pkgOptions.upgrade ? 'Upgrading' : 'Checking'} ${relPathToPackage} catalog dependencies`)
+      } else {
+        // Regular file - read from disk
+        if (isSubsequentPackage) {
+          print(pkgOptions, '')
+        }
+        const result = await findPackage(pkgOptions)
+        pkgData = result.pkgData
+        pkgFile = result.pkgFile || packageInfo.filepath
+        indexKey = pkgFile
+      }
+      // index by relative path if cwd was specified
+      const key = pkgOptions.cwd
+        ? path
+            .relative(path.resolve(pkgOptions.cwd), indexKey)
+            // convert Windows path to *nix path for consistency
+            .replace(/\\/g, '/')
+        : indexKey
+      packages[key] = await runLocal(pkgOptions, pkgData, pkgFile, packageInfo.catalog)
+    }
+    analysis = packages
+    if (options.json) {
+      printJson(options, analysis)
+    }
+  } else {
+    // mutate packageFile when glob pattern finds only single package
+    if (
+      selectedPackageInfos.length === 1 &&
+      selectedPackageInfos[0].filepath !== (options.packageFile || 'package.json')
+    ) {
+      options.packageFile = selectedPackageInfos[0].filepath
+    }
+    const { pkgData, pkgFile } = await findPackage(options)
+    // When packageFilepaths is empty (e.g., running from a subdirectory without a package.json),
+    // use the found package file so the install hint works correctly.
+    if (packageFilepaths.length === 0 && pkgFile) {
+      packageFilepaths = [pkgFile]
+    }
+    analysis = await runLocal(options, pkgData, pkgFile)
+  }
+  clearTimeout(timeout)
+
+  if (options.errorLevel === 2 && someUpgraded(packageFilepaths, analysis, options)) {
+    programError(options, '\nDependencies not up-to-date')
+  }
+
+  // suggest install command or auto-install
+  if (options.upgrade) {
+    // deno does not have an install command
+    // The closest equivalent is deno cache, but it is optional.
+    // See: https://deno.land/manual@v1.30.3/references/cheatsheet#nodejs---deno-cheatsheet
+    if (options.packageManager === 'deno') {
+      print(options, '')
+    } else {
+      await install(packageFilepaths, analysis, options)
+    }
+  }
+
+  return analysis
+}
+
+/** The ncu module. Callable directly (`ncu(options)`) and namespaced (`ncu.run(options)`, `ncu.defineConfig(config)`). */
+export interface Ncu {
+  (runOptions?: RunOptions, options?: { cli?: boolean }): Promise<PackageFile | Index<VersionSpec> | void>
+  run: Ncu
+  defineConfig: typeof defineConfig
+}
+
+/** Main entry point.
+ *
+ * @returns The upgraded package file by default, an {@link Index} of only the
+ * upgraded dependencies with `--jsonUpgraded`, or `void` with `--global`.
+ */
+async function run(
+  runOptions: RunOptions = {},
+  { cli }: { cli?: boolean } = {},
+): Promise<PackageFile | Index<VersionSpec> | void> {
+  if (cli) {
+    registerCliHandlers()
+  }
+
+  unhandledRejectionError = false
+
+  const options = await initOptions(runOptions, { cli })
+  lastRunOptions = options
+
+  // style may already have been initialized in cli.ts, but when imported as a module
+  // styleInit is idempotent
+  styleInit(options.color)
+
+  noVolta(options)
+
+  print(options, 'Initializing', 'verbose')
+
+  if (options.cacheClear) {
+    await cacheClear(options)
+  }
+
+  let timeout: NodeJS.Timeout | undefined
+  let timeoutPromise: Promise<void> = new Promise(() => null)
+  if (options.timeout) {
+    const timeoutMs = typeof options.timeout === 'string' ? Number.parseInt(options.timeout, 10) : options.timeout
+    timeoutPromise = new Promise((resolve, reject) => {
+      timeout = setTimeout(() => {
+        // must catch the error and reject explicitly since we are in a setTimeout
+        const error = `Exceeded global timeout of ${timeoutMs}ms`
+        reject(error)
+        try {
+          programError(options, error)
+        } catch (e) {
+          /* noop */
+        }
+      }, timeoutMs)
+    })
+  }
+
+  // doctor mode
+  if (options.doctor) {
+    // execute with -u
+    if (options.upgrade) {
+      // we have to pass run directly since it would be a circular require if doctor included this file
+      return Promise.race([timeoutPromise, doctor(run, options)])
+    }
+    // print help otherwise
+    else {
+      const help =
+        typeof cliOptionsMap.doctor.help === 'function' ? cliOptionsMap.doctor.help({}) : cliOptionsMap.doctor.help
+      print(options, `Usage: ncu --doctor\n\n${help}`, 'warn')
+    }
+  }
+  // normal mode
+  else {
+    return Promise.race([timeoutPromise, runUpgrades(options, timeout)])
+  }
+}
+
+// expose run and defineConfig as properties so the default export is callable
+// and also namespaced: `ncu({...})`, `ncu.run({...})`, and `ncu.defineConfig(...)` all work
+const ncu = run as Ncu
+ncu.run = ncu
+ncu.defineConfig = defineConfig
+
+export default ncu
+export { ncu as run }
+export { default as defineConfig } from './lib/defineConfig.ts'
+export type { RcOptions } from './types/RcOptions.ts'
+export type { RunOptions } from './types/RunOptions.ts'

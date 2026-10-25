@@ -1,0 +1,91 @@
+import { print, printJson, printSorted, printUpgrades } from '../lib/logging.ts'
+import { type Index } from '../types/IndexType.ts'
+import { type Options } from '../types/Options.ts'
+import getCooldownInfo from './getCooldownInfo.ts'
+import getInstalledPackages from './getInstalledPackages.ts'
+import programError from './programError.ts'
+import quoteGlobalPackageSpec from './quoteGlobalPackageSpec.ts'
+import style from './style.ts'
+import upgradePackageDefinitions from './upgradePackageDefinitions.ts'
+
+/** Checks global dependencies for upgrades. */
+async function runGlobal(options: Options): Promise<Index<string> | void> {
+  print(options, '\nOptions:', 'verbose')
+  printSorted(options, options, 'verbose')
+
+  print(options, '\nGetting installed packages', 'verbose')
+  let globalPackages: Index<string> = {}
+  try {
+    const { cli, cwd, filter, filterVersion, global, packageManager, prefix, reject, rejectVersion } = options
+
+    globalPackages = await getInstalledPackages({
+      cli,
+      cwd,
+      filter,
+      filterVersion,
+      global,
+      packageManager,
+      prefix,
+      reject,
+      rejectVersion,
+    })
+  } catch (e: any) {
+    programError(options, e.message)
+  }
+
+  print(options, 'globalPackages:', 'verbose')
+  print(options, globalPackages, 'verbose')
+  print(options, '', 'verbose')
+  print(options, `Fetching ${options.target} versions`, 'verbose')
+
+  const [upgraded, latest] = await upgradePackageDefinitions(globalPackages, options)
+  print(options, latest, 'verbose')
+
+  const { time, skippedByCooldown, numCooldown } = getCooldownInfo(latest)
+
+  const upgradedPackageNames = Object.keys(upgraded)
+  await printUpgrades(options, {
+    current: globalPackages,
+    upgraded,
+    skippedByCooldown,
+    latest,
+    numCooldown,
+    total: upgradedPackageNames.length,
+    time,
+  })
+
+  const instruction = upgraded
+    ? upgradedPackageNames.map(pkg => quoteGlobalPackageSpec(pkg + '@' + upgraded[pkg])).join(' ')
+    : '[package]'
+
+  if (options.json) {
+    // since global packages do not have a package.json, return the upgraded deps directly (no version range replacements)
+    printJson(options, upgraded)
+  } else if (instruction.length) {
+    const upgradeCmd =
+      options.packageManager === 'yarn'
+        ? 'yarn global upgrade'
+        : options.packageManager === 'pnpm'
+          ? 'pnpm -g add'
+          : options.packageManager === 'bun'
+            ? 'bun add -g'
+            : 'npm -g install'
+
+    print(
+      options,
+      '\n' +
+        style.cyan('ncu') +
+        ' itself cannot upgrade global packages. Run the following to upgrade all global packages: \n\n' +
+        style.cyan(`${upgradeCmd} ` + instruction) +
+        '\n',
+    )
+  }
+
+  // if errorLevel is 2, exit with non-zero error code
+  if (options.cli && options.errorLevel === 2 && upgradedPackageNames.length > 0) {
+    process.exit(1)
+  }
+  return upgraded
+}
+
+export default runGlobal

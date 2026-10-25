@@ -1,0 +1,63 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { type Options } from '../types/Options.ts'
+import { type PackageManagerName } from '../types/PackageManagerName.ts'
+import findLockfile from './findLockfile.ts'
+import { packageManagerForLockfile } from './lockfiles.ts'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+/**
+ * Get the package manager being used to run the command.
+ * When checking global packages, we need to do it this way since there is no
+ * lockfile in the global directory.
+ */
+const getRunningPackageManager = (): PackageManagerName => {
+  const userAgent = process.env.npm_config_user_agent ?? ''
+  const execpath = process.env.npm_execpath ?? ''
+
+  if (
+    userAgent.startsWith('yarn/') ||
+    execpath.includes('yarn') ||
+    __dirname.includes('/yarn/') ||
+    __dirname.includes('\\Yarn\\')
+  )
+    return 'yarn'
+  if (
+    userAgent.startsWith('pnpm/') ||
+    execpath.includes('pnpm') ||
+    __dirname.includes('/pnpm/') ||
+    __dirname.includes('\\pnpm\\')
+  )
+    return 'pnpm'
+  if (
+    userAgent.startsWith('bun/') ||
+    // @ts-expect-error - it is bun
+    typeof Bun !== 'undefined' ||
+    process.versions.bun ||
+    __dirname.includes('/.bun/') ||
+    __dirname.includes('\\.bun\\')
+  )
+    return 'bun'
+
+  return 'npm'
+}
+
+/**
+ * If the packageManager option was not provided, look at the lockfiles to
+ * determine which package manager is being used.
+ */
+const determinePackageManager = async (
+  options: Options,
+  // only for testing
+  readdir: (_path: string) => Promise<string[]> = fs.readdir,
+): Promise<PackageManagerName> => {
+  if (options.packageManager) return options.packageManager
+  else if (options.global) return getRunningPackageManager()
+
+  const lockfileName = (await findLockfile(options, readdir))?.filename
+  return (lockfileName && packageManagerForLockfile(lockfileName)) || 'npm'
+}
+
+export default determinePackageManager
